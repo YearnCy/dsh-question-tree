@@ -1,0 +1,46 @@
+{
+  "name": "dsh-question-tree",
+  "version": "0.1.0",
+  "type": "module",
+  "main": "index.js",
+  "description": "划词提问 + 右栏问题树：选区浮出动作栏、引用 chip、树形追问，装一次即完整可用",
+  "author": "YearnCy",
+  "license": "MIT",
+  "files": [
+    "index.js",
+    "client.js",
+    "build.mjs",
+    "src/",
+    "cordis.patch.yml",
+    "icon.svg",
+    "README.md",
+    "LICENSE"
+  ],
+  "scripts": {
+    "build": "node build.mjs",
+    "check": "node --check client.js",
+    "test": "node test/tree-model.test.mjs && node test/plugin.test.mjs"
+  },
+  "engines": {
+    "dsh": ">=0.2.1-rc.2"
+  },
+  "exports": {
+    ".": "./index.js",
+    "./client": "./client.js",
+    "./package.json": "./package.json",
+    "./icon": "./icon.svg"
+  },
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    },
+    "client": {
+      "platform": "web",
+      "immediately": true,
+      "inject": [
+        "@deepseek-ai/dsh-client-ui-sidebar-right",
+        "@deepseek-ai/dsh-client-ui-conversation"
+      ]
+    }
+  }
+}
