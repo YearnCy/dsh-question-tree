@@ -6,6 +6,21 @@
   "description": "划词提问 + 右栏问题树：选区浮出动作栏、引用 chip、树形追问，装一次即完整可用",
   "author": "YearnCy",
   "license": "MIT",
+  "homepage": "https://github.com/YearnCy/dsh-question-tree#readme",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/YearnCy/dsh-question-tree.git"
+  },
+  "bugs": {
+    "url": "https://github.com/YearnCy/dsh-question-tree/issues"
+  },
+  "keywords": [
+    "dsh",
+    "deepseek-harness",
+    "dsh-plugin",
+    "question-tree",
+    "selection"
+  ],
   "files": [
     "index.js",
     "client.js",
@@ -14,12 +29,14 @@
     "cordis.patch.yml",
     "icon.svg",
     "README.md",
-    "LICENSE"
+    "LICENSE",
+    "docs/"
   ],
   "scripts": {
     "build": "node build.mjs",
     "check": "node --check client.js",
-    "test": "node test/tree-model.test.mjs && node test/plugin.test.mjs"
+    "test": "node test/tree-model.test.mjs && node test/plugin.test.mjs",
+    "prepublishOnly": "npm run check && npm test"
   },
   "engines": {
     "dsh": ">=0.2.1-rc.2"
