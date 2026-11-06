@@ -20,16 +20,22 @@
 
 需要 DSH Desktop 桌面版 `>= 0.2.1-rc.2`。
 
-从本仓库安装：
+从 GitHub 直装（插件市场里给的就是这条）：
 
 ```powershell
-dsh plugin --profile desktop add -w "file:<本仓库路径>"
+dsh plugin --profile desktop add github:YearnCy/dsh-question-tree
 ```
 
-从 npm 安装：
+从 npm 安装（发布之后）：
 
 ```powershell
 dsh plugin --profile desktop add -w dsh-question-tree
+```
+
+在本地改代码时，用 `file:` 指向克隆下来的目录：
+
+```powershell
+dsh plugin --profile desktop add -w "file:<本仓库路径>"
 ```
 
 装完**重启 DSH**，右栏「开始」页会出现「问题树」入口（下图红框）：
@@ -45,12 +51,14 @@ dsh plugin --profile desktop add -w dsh-question-tree
 
 两条路互不干扰：**问题树记位置，输入框发消息。**
 
+> DSH 0.2.2 起，平台自己提供划词引用（原生「引用文本」按钮，消息里是 Markdown 引用块），插件就只保留「树形提问」一个按钮，不再重复那个入口。老版本上仍然是两个。
+
 ### 划词之后
 
 1. 在对话里选中一段文字（可以很短，比如一个术语），浮出按钮栏
 2. 按钮左边标着这次会挂到哪个节点下（`→ 父引文`），先看一眼再点
 3. **树形提问**：建节点 + 展开输入框，用你自己的话提问，`Enter` 发送、`Esc` 取消
-4. **添加到对话**：只把 `「引用」` 插到光标处，不建节点、不改树
+4. 只想把这段引用丢进输入框（0.2.1 或更早）：点**添加到对话**，只把 `「引用」` 插到光标处，不建节点、不改树
 
 问题发出去后节点会带 `待回答`，一轮回答结束自动变 `已回答`。
 
@@ -96,7 +104,12 @@ dsh plugin --profile desktop add -w dsh-question-tree
 - **仅桌面版**：依赖 DSH Desktop 的右栏与选区接口
 - **同一会话共享一棵树**：换会话就是另一棵树，树不跨会话合并
 - **不做分支**：所有提问仍写进同一条对话流，树只是索引
-- **输入框 chip 依赖 DSH 内部接口**：升级 DSH 后偶尔会退回成纯文本插入，功能不受影响
+- **引用走平台**：DSH 0.2.2 起，「添加到对话」用平台原生的 `insertQuote`（消息里是 Markdown 引用块，由核心的 `dsh-message-quotes` 渲染）；插件自己的 `「…」` chip 只服务「树形提问」发出的那条消息。老版本上仍整条走 chip，退化成纯文本也不影响功能
+
+## 兼容性
+
+- **DSH 0.2.2**：核心新增了 `@deepseek-ai/dsh-message-quotes`，它占用 user-text 规则 id `quote` 和 `conversation.user.text.node` 的键 `quote`。插件从 0.1.1 起改用 `selection-quote`，两者不再打架；同时 chip 与规则的注册都加了保护，撞名只会退化成没有 chip，不会让整个 web boot 失败
+- **DSH 0.2.1**：行为不变，引用仍是插件自己的 chip
 
 ## 开发
 

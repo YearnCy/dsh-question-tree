@@ -21,6 +21,16 @@ window.__ModuleLoader__.load({
     const h = React.createElement;
 
     const ID = '@local/selection-hub';
+    /**
+     * The user-text rule id, and the keyed slot key that renders its nodes.
+     *
+     * It must NOT be `quote`: DSH 0.2.2 ships `@deepseek-ai/dsh-message-quotes`,
+     * which registers a rule id `quote` and a `conversation.user.text.node` key
+     * `quote` itself. `UserTextRegistry.register` throws on a duplicate id, so
+     * sharing the name made that core bundle fail to activate and took the whole
+     * web boot down with it.
+     */
+    const QUOTE_NODE_ID = 'selection-quote';
     const SETTINGS_KEY = 'dsh.selection-hub.actions';
     const CHIP_STYLE = {
       display: 'flex',
@@ -209,7 +219,7 @@ window.__ModuleLoader__.load({
         }
 
         try {
-          const serialized = await serialize('quote', token);
+          const serialized = await serialize(QUOTE_NODE_ID, token);
           if (serialized == null || String(serialized).trim() === '') return 'preflight-empty';
         } catch (error) {
           const message = error && error.message ? String(error.message) : 'rejected';
@@ -220,7 +230,7 @@ window.__ModuleLoader__.load({
         if (span == null) return 'no-span';
         const payload = {
           reference: {
-            source: 'quote',
+            source: QUOTE_NODE_ID,
             label: token.trim(),
             ref: token,
             appearance: 'session',
@@ -274,7 +284,10 @@ window.__ModuleLoader__.load({
       const turn = row.getAttribute('data-chat-turn');
       const anchor =
         nodeKey == null && turn == null ? null : { nodeKey: nodeKey ?? null, turn: turn ?? null };
-      return { text, rect, anchor };
+      // The live Range and row ride along: the bar re-measures the selection
+      // every animation frame so it follows scrolling as tightly as the host's
+      // own pill does, which keeps its own selection range for the same reason.
+      return { text, rect, anchor, range, row };
     }
 
     /**
@@ -313,11 +326,69 @@ window.__ModuleLoader__.load({
       }
     }
 
+    /**
+     * The visible box the conversation is actually scrolled inside.
+     *
+     * The bar is `position: fixed`, while the host's pill lives inside the chat
+     * column and is clipped by its scroller. Measuring that scroller is what
+     * lets the bar disappear with the selection instead of parking on top of
+     * the composer once the text has scrolled away.
+     *
+     * @param element - any node inside the conversation.
+     * @returns the scroller's on-screen box, clipped to the viewport.
+     */
+    function chatViewport(element) {
+      const view = {
+        top: 0,
+        left: 0,
+        right: window.innerWidth,
+        bottom: window.innerHeight,
+      };
+      let node = element;
+      while (node != null && node !== document.body) {
+        const style = node.ownerDocument.defaultView.getComputedStyle(node);
+        const scrolls = /(auto|scroll|overlay)/.test(style.overflowY);
+        if (scrolls && node.scrollHeight > node.clientHeight + 1) {
+          const rect = node.getBoundingClientRect();
+          return {
+            top: Math.max(rect.top, view.top),
+            left: Math.max(rect.left, view.left),
+            right: Math.min(rect.right, view.right),
+            bottom: Math.min(rect.bottom, view.bottom),
+          };
+        }
+        node = node.parentElement;
+      }
+      return view;
+    }
+
+    /**
+     * The host's own selection surface, when it is actually showing.
+     *
+     * DSH 0.2.2 renders it inside the chat column as
+     * `[data-text-interaction-surface]`, placed above the selection and hidden
+     * with `visibility` rather than unmounted, so both that attribute and the
+     * computed style have to agree before it counts.
+     */
+    function nativeSurfaceRect() {
+      if (typeof document === 'undefined') return null;
+      const element = document.querySelector('[data-text-interaction-surface]');
+      if (element === null) return null;
+      if (element.getAttribute('aria-hidden') === 'true') return null;
+      const view = element.ownerDocument.defaultView;
+      if (view !== null && view.getComputedStyle(element).visibility === 'hidden') return null;
+      const rect = element.getBoundingClientRect();
+      if (rect.width === 0 || rect.height === 0) return null;
+      return rect;
+    }
+
     /* ------------------------------------------------------------- components */
 
     function ActionBar({ ctx }) {
       const [chip, setChip] = React.useState(null);
+      const [place, setPlace] = React.useState(null);
       const [alt, setAlt] = React.useState(false);
+      const barRef = React.useRef(null);
 
       // Nothing is published while the pointer is down: a bar under the cursor
       // moves the selection, which republishes the bar, which moves it again.
@@ -334,13 +405,19 @@ window.__ModuleLoader__.load({
             if (
               previous !== null &&
               previous.text === next.text &&
-              previous.rect.top === next.rect.top &&
-              previous.rect.left === next.rect.left &&
-              previous.rect.width === next.rect.width
+              previous.range.startContainer === next.range.startContainer &&
+              previous.range.startOffset === next.range.startOffset &&
+              previous.range.endContainer === next.range.endContainer &&
+              previous.range.endOffset === next.range.endOffset
             ) {
               return previous;
             }
-            return { text: next.text, rect: next.rect, anchor: next.anchor };
+            return {
+              text: next.text,
+              anchor: next.anchor,
+              range: next.range,
+              row: next.row,
+            };
           });
         };
 
@@ -367,24 +444,71 @@ window.__ModuleLoader__.load({
           schedule(0);
         };
         const onSelection = () => schedule();
-        const onScroll = () => schedule(0);
 
+        // Scrolling is not re-published: the placement loop measures the live
+        // range every frame, which is far tighter than a debounce and is what
+        // keeps this bar moving with the text the way the host's own pill does.
         document.addEventListener('pointerdown', onDown, true);
         document.addEventListener('pointerup', onUp, true);
         document.addEventListener('selectionchange', onSelection);
-        document.addEventListener('keyup', onScroll, true);
-        window.addEventListener('scroll', onScroll, true);
-        window.addEventListener('resize', onScroll);
         return () => {
           document.removeEventListener('pointerdown', onDown, true);
           document.removeEventListener('pointerup', onUp, true);
           document.removeEventListener('selectionchange', onSelection);
-          document.removeEventListener('keyup', onScroll, true);
-          window.removeEventListener('scroll', onScroll, true);
-          window.removeEventListener('resize', onScroll);
           cancel();
         };
       }, []);
+
+      // Glue the bar to the selection: every frame re-measures the live range
+      // and the host's own pill, so scrolling tracks in the same frame instead
+      // of arriving after it settles. The bar also disappears once its line
+      // leaves the conversation's scroller, the way the host's pill is clipped
+      // by it — a fixed-position element would otherwise park over the composer.
+      React.useEffect(() => {
+        if (chip == null || typeof window.requestAnimationFrame !== 'function') return undefined;
+        let frame = 0;
+
+        const measure = () => {
+          frame = window.requestAnimationFrame(measure);
+          const { range, row } = chip;
+          if (range == null || row == null || !row.isConnected) {
+            setPlace(null);
+            return;
+          }
+          const host = chatViewport(row);
+          const line =
+            [...range.getClientRects()].find(
+              (rect) => rect.bottom > host.top && rect.top < host.bottom,
+            ) ?? null;
+          if (line == null) {
+            setPlace(null);
+            return;
+          }
+          const native = nativeSurfaceRect();
+          const bar = barRef.current;
+          const width = bar == null ? 0 : bar.offsetWidth;
+          const height = bar == null ? 28 : bar.offsetHeight;
+          const baseLeft = native == null ? line.left : native.left;
+          const left = Math.min(
+            Math.max(host.left + 8, baseLeft),
+            Math.max(host.left + 8, host.right - width - 8),
+          );
+          const above = (native == null ? line.top : native.top) - 6;
+          const fits = above - height >= host.top;
+          const top = fits ? above : (native == null ? line.bottom : native.bottom) + 8;
+          setPlace((previous) =>
+            previous !== null &&
+            previous.top === top &&
+            previous.left === left &&
+            previous.above === fits
+              ? previous
+              : { top, left, above: fits },
+          );
+        };
+
+        frame = window.requestAnimationFrame(measure);
+        return () => window.cancelAnimationFrame(frame);
+      }, [chip]);
 
       React.useEffect(() => {
         const down = (event) => {
@@ -404,14 +528,11 @@ window.__ModuleLoader__.load({
         };
       }, []);
 
-      if (chip == null) return null;
+      if (chip == null || place == null) return null;
       const sessionId = LAST_SESSION;
       if (sessionId == null) return null;
       const actions = enabledActions();
       if (actions.length === 0) return null;
-
-      const top = Math.max(8, chip.rect.top - 40);
-      const left = Math.min(Math.max(8, chip.rect.left), Math.max(8, window.innerWidth - 150));
 
       const run = (action, event) => {
         try {
@@ -432,11 +553,15 @@ window.__ModuleLoader__.load({
       return h(
         'div',
         {
+          ref: barRef,
           'data-selection-hub-bar': true,
           style: {
             position: 'fixed',
-            top,
-            left,
+            top: place.top,
+            left: place.left,
+            // `above` anchors by the bar's bottom edge, so it clears the host's
+            // pill without having to know either height in advance.
+            transform: place.above ? 'translateY(-100%)' : 'none',
             zIndex: 2147483000,
             display: 'flex',
             flexDirection: 'column',
@@ -513,7 +638,7 @@ window.__ModuleLoader__.load({
     }
 
     const quoteRule = {
-      id: 'quote',
+      id: QUOTE_NODE_ID,
       order: 10,
       match(text, from) {
         if (typeof text !== 'string' || from > 0) return undefined;
@@ -538,7 +663,7 @@ window.__ModuleLoader__.load({
         if (end <= 1) return undefined;
         const quote = text.slice(1, end);
         if (quote.length > 300) return undefined;
-        return { id: 'quote', start: 0, end: end + 1, data: { quote } };
+        return { id: QUOTE_NODE_ID, start: 0, end: end + 1, data: { quote } };
       },
     };
 
@@ -567,34 +692,53 @@ window.__ModuleLoader__.load({
     function apply(ctx) {
       ctx.effect(() => ctx.reflect.provide('selectionActions', API), 'selection-hub: service');
 
+      // 0.2.2 owns selection quoting: the core `@deepseek-ai/dsh-message-quotes`
+      // registers the same gesture and renders its own 「引用文本」 pill right
+      // where this bar sits. Registering a second "add to the composer" button
+      // only draws a duplicate on top of it, so ours is for hosts without that
+      // interaction surface (0.2.1) and stays off when the platform has one.
+      const hasNativeQuote =
+        ctx.uiConversation != null &&
+        ctx.uiConversation.interactions != null &&
+        typeof ctx.uiConversation.interactions.register === 'function';
+
       // Built-in action: a quote can go straight into the composer, with no
       // consumer plugin involved. Chip first, plain text second, clipboard last.
-      ctx.effect(
-        () =>
-          register({
-            id: 'to-composer',
-            order: 20,
-            icon: '↧',
-            label: () => '添加到对话',
-            run: ({ text, sessionId }) => {
-              if (sessionId == null) return false;
-              const token = `${formatQuote(text)} `;
-              insertChip(ctx, sessionId, token).then((outcome) => {
-                if (outcome === 'ok') return;
-                console.warn('[selection-hub] composer chip fell back:', outcome);
-                if (insertText(sessionId, token) !== 'sent') {
+      if (!hasNativeQuote)
+        ctx.effect(
+          () =>
+            register({
+              id: 'to-composer',
+              order: 20,
+              icon: '↧',
+              label: () => '添加到对话',
+              run: ({ text, sessionId }) => {
+                if (sessionId == null) return false;
+                const api = INPUT.get(sessionId);
+                if (api != null && typeof api.insertQuote === 'function') {
                   try {
-                    navigator.clipboard.writeText(token);
+                    if (api.insertQuote(text)) return true;
                   } catch {
-                    /* ignore */
+                    /* fall through to the chip path */
                   }
                 }
-              });
-              return true;
-            },
-          }),
-        'selection-hub: to-composer action',
-      );
+                const token = `${formatQuote(text)} `;
+                insertChip(ctx, sessionId, token).then((outcome) => {
+                  if (outcome === 'ok') return;
+                  console.warn('[selection-hub] composer chip fell back:', outcome);
+                  if (insertText(sessionId, token) !== 'sent') {
+                    try {
+                      navigator.clipboard.writeText(token);
+                    } catch {
+                      /* ignore */
+                    }
+                  }
+                });
+                return true;
+              },
+            }),
+          'selection-hub: to-composer action',
+        );
 
       // The composer chip's serialization routes through this codec. Without it,
       // a chip would make the draft unsubmittable.
@@ -603,7 +747,7 @@ window.__ModuleLoader__.load({
         ctx.effect(() => {
           try {
             const dispose = triggers.registerSource({
-              name: 'quote',
+              name: QUOTE_NODE_ID,
               trigger: '@',
               codec: { serialize: (ref) => Promise.resolve(ref) },
             });
@@ -640,18 +784,30 @@ window.__ModuleLoader__.load({
         'selection-hub: composer bridge',
       );
 
-      ctx.effect(
-        () => ctx.uiConversation.userText.register(quoteRule),
-        'selection-hub: quote matcher',
-      );
+      // A duplicate rule id or slot key throws, and an exception thrown while
+      // this entry activates fails the whole web boot. The quote chip is an
+      // enhancement, not the feature: report it and keep the tree working.
+      ctx.effect(() => {
+        try {
+          return ctx.uiConversation.userText.register(quoteRule);
+        } catch (error) {
+          console.warn('[selection-hub] quote rule skipped:', error);
+          return () => {};
+        }
+      }, 'selection-hub: quote matcher');
       ctx.effect(
         () =>
-          ctx.slots.inject('conversation.user.text.node', () =>
-            ctx.slots.register(
-              { name: 'conversation.user.text.node', key: 'quote', priority: 100 },
-              QuoteChip,
-            ),
-          ),
+          ctx.slots.inject('conversation.user.text.node', () => {
+            try {
+              return ctx.slots.register(
+                { name: 'conversation.user.text.node', key: QUOTE_NODE_ID, priority: 100 },
+                QuoteChip,
+              );
+            } catch (error) {
+              console.warn('[selection-hub] quote chip skipped:', error);
+              return () => {};
+            }
+          }),
         'selection-hub: quote chip',
       );
 
