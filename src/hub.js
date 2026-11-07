@@ -28,6 +28,12 @@ window.__ModuleLoader__.load({
      * web boot down with it.
      */
     const QUOTE_NODE_ID = 'selection-quote';
+    /** Monotonic id, so each new selection mounts a fresh bar element. */
+    let SELECTION_SEQ = 0;
+    /** Last measured size of the host's pill, used to predict its seat. */
+    let LAST_NATIVE_SIZE = null;
+    /** The context this plugin was applied to, for capability questions. */
+    let HUB_CTX = null;
     const SETTINGS_KEY = 'dsh.selection-hub.actions';
     const CHIP_STYLE = {
       display: 'flex',
@@ -379,6 +385,82 @@ window.__ModuleLoader__.load({
       return rect;
     }
 
+    /**
+     * The host's surface size even while it is still hidden.
+     *
+     * The host renders the pill's content the moment a gesture starts and only
+     * reveals it a frame later, so its box is already laid out — measuring it
+     * lets the bar predict the very spot the pill will occupy and show itself
+     * immediately, instead of waiting to copy a position that does not exist
+     * yet.
+     *
+     * @returns the surface's box when it has content, otherwise null.
+     */
+    function nativeSurfaceSize() {
+      if (typeof document === 'undefined') return null;
+      const element = document.querySelector('[data-text-interaction-surface]');
+      if (element === null) return null;
+      const rect = element.getBoundingClientRect();
+      if (rect.width === 0 || rect.height === 0) return null;
+      return rect;
+    }
+
+    /**
+     * Where the host's pill will sit, copied from its own placement rules: the
+     * first visible line of the selection, centred, above it when it fits.
+     *
+     * @param line - the selection line the pill anchors to.
+     * @param size - the pill's measured size.
+     * @param host - the conversation's visible box.
+     * @returns the predicted box, in viewport coordinates.
+     */
+    function predictSeat(line, size, host) {
+      const gap = 8;
+      const left = Math.max(
+        host.left,
+        (Math.max(line.left, host.left) + Math.min(line.right, host.right) - size.width) / 2,
+      );
+      const above = line.top - gap - size.height;
+      const top = above >= host.top ? above : line.bottom + gap;
+      return { left, top, bottom: top + size.height };
+    }
+
+    /**
+     * Whether the host has a handler registered for the selection gesture.
+     *
+     * The DOM cannot answer this reliably: the host's pill is rendered later
+     * than our first frame, and a host may keep the surface mounted with no
+     * content at all. Its interaction registry can, and it says exactly which
+     * gesture ids are owned — `quote` is the core message-quotes plugin.
+     *
+     * @param ctx - the plugin context.
+     * @returns whether the host owns the selection gesture right now.
+     */
+    function hostOwnsQuote(ctx) {
+      try {
+        const registry = ctx.uiConversation == null ? null : ctx.uiConversation.interactions;
+        if (registry == null || typeof registry.getSnapshot !== 'function') return false;
+        const ids = registry.getSnapshot();
+        return Array.isArray(ids) && ids.includes('quote');
+      } catch {
+        return false;
+      }
+    }
+
+    /**
+     * Whether an action is already provided by the host itself.
+     *
+     * Only the composer one has a host counterpart: 0.2.2 owns selection
+     * quoting end to end, so offering ours as well would be a duplicate entry
+     * in the bar and a dead switch in the settings panel.
+     *
+     * @param id - the action id.
+     * @returns whether the host owns this capability.
+     */
+    function isHostOwned(id) {
+      return id === 'to-composer' && HUB_CTX != null && hostOwnsQuote(HUB_CTX);
+    }
+
     /* ------------------------------------------------------------- components */
 
     function ActionBar({ ctx }) {
@@ -410,6 +492,10 @@ window.__ModuleLoader__.load({
               return previous;
             }
             return {
+              // A new selection gets a new element: reusing the old node makes
+              // the browser paint the bar travelling from its previous spot,
+              // which reads as an animation between two unrelated places.
+              key: ++SELECTION_SEQ,
               text: next.text,
               anchor: next.anchor,
               range: next.range,
@@ -440,7 +526,10 @@ window.__ModuleLoader__.load({
           dragging = false;
           schedule(0);
         };
-        const onSelection = () => schedule();
+        // Both triggers publish at once: the pointer is already up, and any
+        // debounce here only delays the bar while the host's own pill is
+        // drawn immediately.
+        const onSelection = () => schedule(0);
 
         // Scrolling is not re-published: the placement loop measures the live
         // range every frame, which is far tighter than a debounce and is what
@@ -463,10 +552,19 @@ window.__ModuleLoader__.load({
       // by it — a fixed-position element would otherwise park over the composer.
       React.useEffect(() => {
         if (chip == null || typeof window.requestAnimationFrame !== 'function') return undefined;
+        // A host that owns this gesture (0.2.2) reveals its own pill a frame or
+        // two after the selection settles. Waiting for that reveal copied the
+        // pill's position but made the bar arrive late; instead the bar reads
+        // the pill's already-laid-out box and predicts where it will land, so
+        // both appear together. A host without such a surface (0.2.1) takes the
+        // plain selection-relative path, exactly as before.
         let frame = 0;
+        let frames = 0;
+        const hasSurface = document.querySelector('[data-text-interaction-surface]') !== null;
 
         const measure = () => {
           frame = window.requestAnimationFrame(measure);
+          frames += 1;
           const { range, row } = chip;
           if (range == null || row == null || !row.isConnected) {
             setPlace(null);
@@ -482,24 +580,36 @@ window.__ModuleLoader__.load({
             return;
           }
           const native = nativeSurfaceRect();
+          // The pill's real box once it is placed; its content box while it is
+          // still hidden; the last size seen when this frame has neither yet.
+          // The bar never waits for the pill: it is drawn on the first frame at
+          // the spot the pill is about to occupy.
+          const measured = native ?? nativeSurfaceSize();
+          if (measured != null) LAST_NATIVE_SIZE = { width: measured.width, height: measured.height };
+          const carrier = measured ?? LAST_NATIVE_SIZE ?? { width: 132, height: 32 };
+          const seat = hasSurface ? (native ?? predictSeat(line, carrier, host)) : null;
+          const ready = true;
           const bar = barRef.current;
           const width = bar == null ? 0 : bar.offsetWidth;
           const height = bar == null ? 28 : bar.offsetHeight;
-          const baseLeft = native == null ? line.left : native.left;
+          const baseLeft = seat == null ? line.left : seat.left;
           const left = Math.min(
             Math.max(host.left + 8, baseLeft),
             Math.max(host.left + 8, host.right - width - 8),
           );
-          const above = (native == null ? line.top : native.top) - 6;
+          const above = (seat == null ? line.top : seat.top) - 6;
           const fits = above - height >= host.top;
-          const top = fits ? above : (native == null ? line.bottom : native.bottom) + 8;
+          const top = fits ? above : (seat == null ? line.bottom : seat.bottom) + 8;
           setPlace((previous) =>
             previous !== null &&
+            previous.key === chip.key &&
             previous.top === top &&
             previous.left === left &&
-            previous.above === fits
+            previous.above === fits &&
+            previous.native === (seat != null) &&
+            previous.ready === ready
               ? previous
-              : { top, left, above: fits },
+              : { key: chip.key, top, left, above: fits, native: seat != null, ready },
           );
         };
 
@@ -525,10 +635,24 @@ window.__ModuleLoader__.load({
         };
       }, []);
 
-      if (chip == null || place == null) return null;
+      // `place` outlives a single selection (it is measured per frame), so it
+      // must not be painted for a NEW one: its coordinates belong to the old
+      // selection, and drawing there for even one frame is the bar visibly
+      // hopping from one line to the next. Until this selection has its own
+      // measurement, nothing is drawn at all.
+      if (chip == null || place == null || place.key !== chip.key) return null;
       const sessionId = LAST_SESSION;
       if (sessionId == null) return null;
-      const actions = enabledActions();
+      // The host draws its own 「引用文本」 pill for this gesture, so ours would
+      // be a second button for the same thing: drop it. The registry is asked
+      // rather than the DOM, because the pill appears a frame later and its
+      // absence at that moment says nothing. Anywhere the host owns no such
+      // handler — 0.2.1 and older, or a 0.2.2 with that core plugin off — the
+      // button stays available.
+      const owned = place.native || isHostOwned('to-composer');
+      const actions = enabledActions().filter(
+        (action) => !(owned && action.id === 'to-composer'),
+      );
       if (actions.length === 0) return null;
 
       const run = (action, event) => {
@@ -551,6 +675,7 @@ window.__ModuleLoader__.load({
         'div',
         {
           ref: barRef,
+          key: chip.key,
           'data-selection-hub-bar': true,
           style: {
             position: 'fixed',
@@ -559,6 +684,14 @@ window.__ModuleLoader__.load({
             // `above` anchors by the bar's bottom edge, so it clears the host's
             // pill without having to know either height in advance.
             transform: place.above ? 'translateY(-100%)' : 'none',
+            // Never animate a position that is chosen per frame anyway: a host
+            // rule that eases `all` would turn every re-measure into a glide.
+            transition: 'none',
+            // Laid out but not painted until the host's pill has taken its
+            // place: this is what removes the jump, and it still measures the
+            // bar's real size for the frame that reveals it.
+            visibility: place.ready ? 'visible' : 'hidden',
+            pointerEvents: place.ready ? 'auto' : 'none',
             zIndex: 2147483000,
             display: 'flex',
             flexDirection: 'column',
@@ -669,6 +802,13 @@ window.__ModuleLoader__.load({
     const API = {
       register,
       actions: () => ACTIONS.slice(),
+      /**
+       * The actions this host can actually offer: the composer one is the
+       * fallback for hosts without their own quoting gesture, so it is not
+       * listed where the host already provides it.
+       * @returns the offered actions.
+       */
+      available: () => ACTIONS.filter((action) => !isHostOwned(action.id)),
       enabledActions,
       isEnabled,
       setEnabled(id, value) {
@@ -687,55 +827,53 @@ window.__ModuleLoader__.load({
     /* ----------------------------------------------------------------- apply */
 
     function apply(ctx) {
+      HUB_CTX = ctx;
       ctx.effect(() => ctx.reflect.provide('selectionActions', API), 'selection-hub: service');
-
-      // 0.2.2 owns selection quoting: the core `@deepseek-ai/dsh-message-quotes`
-      // registers the same gesture and renders its own 「引用文本」 pill right
-      // where this bar sits. Registering a second "add to the composer" button
-      // only draws a duplicate on top of it, so ours is for hosts without that
-      // interaction surface (0.2.1) and stays off when the platform has one.
-      const hasNativeQuote =
-        ctx.uiConversation != null &&
-        ctx.uiConversation.interactions != null &&
-        typeof ctx.uiConversation.interactions.register === 'function';
 
       // Built-in action: a quote can go straight into the composer, with no
       // consumer plugin involved. Chip first, plain text second, clipboard last.
-      if (!hasNativeQuote)
-        ctx.effect(
-          () =>
-            register({
-              id: 'to-composer',
-              order: 20,
-              icon: '↧',
-              label: () => '添加到对话',
-              run: ({ text, sessionId }) => {
-                if (sessionId == null) return false;
-                const api = INPUT.get(sessionId);
-                if (api != null && typeof api.insertQuote === 'function') {
+      //
+      // It is registered on EVERY host, including 0.2.2 where the core
+      // `@deepseek-ai/dsh-message-quotes` owns the same gesture: whether the
+      // host actually draws its own 「引用文本」 pill is a render-time fact, not
+      // a boot-time one, and gating registration on the presence of the
+      // interaction service would take the button away from a 0.2.2 user who
+      // has that core plugin switched off. The bar hides it per frame instead,
+      // whenever the host's surface is really on screen.
+      ctx.effect(
+        () =>
+          register({
+            id: 'to-composer',
+            order: 20,
+            icon: '↧',
+            label: () => '添加到对话',
+            run: ({ text, sessionId }) => {
+              if (sessionId == null) return false;
+              const api = INPUT.get(sessionId);
+              if (api != null && typeof api.insertQuote === 'function') {
+                try {
+                  if (api.insertQuote(text)) return true;
+                } catch {
+                  /* fall through to the chip path */
+                }
+              }
+              const token = `${formatQuote(text)} `;
+              insertChip(ctx, sessionId, token).then((outcome) => {
+                if (outcome === 'ok') return;
+                console.warn('[selection-hub] composer chip fell back:', outcome);
+                if (insertText(sessionId, token) !== 'sent') {
                   try {
-                    if (api.insertQuote(text)) return true;
+                    navigator.clipboard.writeText(token);
                   } catch {
-                    /* fall through to the chip path */
+                    /* ignore */
                   }
                 }
-                const token = `${formatQuote(text)} `;
-                insertChip(ctx, sessionId, token).then((outcome) => {
-                  if (outcome === 'ok') return;
-                  console.warn('[selection-hub] composer chip fell back:', outcome);
-                  if (insertText(sessionId, token) !== 'sent') {
-                    try {
-                      navigator.clipboard.writeText(token);
-                    } catch {
-                      /* ignore */
-                    }
-                  }
-                });
-                return true;
-              },
-            }),
-          'selection-hub: to-composer action',
-        );
+              });
+              return true;
+            },
+          }),
+        'selection-hub: to-composer action',
+      );
 
       // The composer chip's serialization routes through this codec. Without it,
       // a chip would make the draft unsubmittable.

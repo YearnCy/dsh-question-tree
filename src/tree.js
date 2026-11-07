@@ -1674,7 +1674,11 @@ window.__ModuleLoader__.load({
       // bar offers. The tree owns no registry — it asks the hub handed to it at
       // apply time, or the injected service in the split build.
       const hub = info.hub ?? null;
-      const registered = hub == null ? [] : hub.actions();
+      // Only what this host can actually offer: the composer action is the
+      // fallback for hosts without their own quoting, so its switch would be
+      // dead weight where the platform already provides 「引用文本」.
+      const registered =
+        hub == null ? [] : typeof hub.available === 'function' ? hub.available() : hub.actions();
       const actionEnabled = (id) => (hub == null ? true : hub.isEnabled(id));
       const actionSection =
         registered.length === 0

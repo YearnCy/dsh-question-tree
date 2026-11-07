@@ -109,7 +109,8 @@ dsh plugin --profile desktop add -w "file:<本仓库路径>"
 ## 兼容性
 
 - **DSH 0.2.2**：核心新增了 `@deepseek-ai/dsh-message-quotes`，它占用 user-text 规则 id `quote` 和 `conversation.user.text.node` 的键 `quote`。插件从 0.1.1 起改用 `selection-quote`，两者不再打架；同时 chip 与规则的注册都加了保护，撞名只会退化成没有 chip，不会让整个 web boot 失败
-- **DSH 0.2.1**：行为不变，引用仍是插件自己的 chip
+- **DSH 0.2.2 且自己画了「引用文本」时**：「添加到对话」这个按钮按帧让位，避免和原生按钮重复；按钮本身仍然注册，所以把核心 `dsh-message-quotes` 关掉的人依旧能用
+- **DSH 0.2.1**：行为不变，引用仍是插件自己的 chip，两个按钮都在
 
 ## 开发
 

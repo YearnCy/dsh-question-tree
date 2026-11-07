@@ -167,10 +167,11 @@ test('the panel still renders', () => {
   assert.ok(element.type);
 });
 
-test('a host with its own quote surface gets no duplicate "add to composer"', () => {
-  // 0.2.2's @deepseek-ai/dsh-message-quotes already renders 「引用文本」 at the
-  // same anchor; a second button there only covers it. Module state accumulates
-  // across applies, so compare what this apply ADDS.
+test('"add to composer" is offered on every host, so old DSH never loses it', () => {
+  // 0.2.2's @deepseek-ai/dsh-message-quotes draws its own 「引用文本」 pill, and
+  // the bar drops this button only while that pill is on screen. It must still
+  // be REGISTERED everywhere: a host without the pill (0.2.1, or 0.2.2 with
+  // that core plugin off) has no other way to put a quote in the composer.
   const api = applyToFakeContext().provided.selectionActions;
   const before = api.actions().map((action) => action.id);
 
@@ -192,7 +193,7 @@ test('a host with its own quote surface gets no duplicate "add to composer"', ()
   };
   mod.apply(ctx);
   const added = api.actions().map((action) => action.id).slice(before.length);
-  assert.deepEqual(added, ['question-tree']);
+  assert.deepEqual(added.sort(), ['question-tree', 'to-composer']);
 });
 
 test('DSH 0.2.2: the core quote plugin does not take the tree down with it', () => {
