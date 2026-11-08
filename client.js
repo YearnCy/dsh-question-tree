@@ -288,8 +288,21 @@ window.__ModuleLoader__.load({
       if (rect.width === 0 && rect.height === 0) return null;
       const nodeKey = row.getAttribute('data-chat-node-key');
       const turn = row.getAttribute('data-chat-turn');
+      // A step can be rendered more than once: its reasoning and its response
+      // are separate wrappers with the same node key. `anchorKey` names the
+      // exact wrapper that was selected, so a later jump can return to the
+      // response instead of the (usually hidden) reasoning copy.
+      const anchorKey = row.getAttribute('data-chat-anchor-key');
+      const groupPart = row.getAttribute('data-chat-group-part');
       const anchor =
-        nodeKey == null && turn == null ? null : { nodeKey: nodeKey ?? null, turn: turn ?? null };
+        nodeKey == null && turn == null
+          ? null
+          : {
+              nodeKey: nodeKey ?? null,
+              turn: turn ?? null,
+              anchorKey: anchorKey ?? null,
+              groupPart: groupPart ?? null,
+            };
       // The live Range and row ride along: the bar re-measures the selection
       // every animation frame so it follows scrolling as tightly as the host's
       // own pill does, which keeps its own selection range for the same reason.
@@ -308,9 +321,11 @@ window.__ModuleLoader__.load({
           ? CSS.escape(value)
           : String(value).replace(/["\\]/g, '\\$&');
       const selector =
-        anchor.nodeKey != null
-          ? `[data-chat-node-key="${escape(anchor.nodeKey)}"]`
-          : anchor.turn != null
+        anchor.anchorKey != null
+          ? `[data-chat-anchor-key="${escape(anchor.anchorKey)}"]`
+          : anchor.nodeKey != null
+            ? `[data-chat-node-key="${escape(anchor.nodeKey)}"]`
+            : anchor.turn != null
             ? `[data-chat-turn="${escape(String(anchor.turn))}"]`
             : null;
       if (selector === null) return false;
@@ -1527,6 +1542,10 @@ return { oneLine, labelOf, createNode, addQuestion, addQuote, removeQuestion, ma
      */
     const LOCATE_CURSOR = new Map();
     const INPUT = new Map();
+    // A jump re-asserts its landing for a moment, so a new jump (the next
+    // passage of the same node, or another node) must cancel the previous
+    // loop; otherwise the two would scroll the transcript against each other.
+    let LOCATE_CANCEL = null;
 
     /**
      * ── selection hub ──────────────────────────────────────────────────────
@@ -2617,41 +2636,220 @@ return { oneLine, labelOf, createNode, addQuestion, addQuote, removeQuestion, ma
       return -1;
     }
 
+    /** Whether an element currently scrolls vertically. */
+    function scrollsVertically(element) {
+      if (element == null) return false;
+      const style = window.getComputedStyle(element);
+      return /(auto|scroll|overlay)/.test(style.overflowY) && element.scrollHeight > element.clientHeight + 1;
+    }
+
+    /**
+     * The conversation viewport a jump has to move.
+     *
+     * Newer hosts wrap the transcript in `[data-conversation-scroll]`, and an
+     * open process group nests its own capped, scrollable body inside it.
+     * Walking up from the quoted text stops at that inner body and scrolls the
+     * wrong box — the conversation itself never moves, so the jump looks dead
+     * until the reader scrolls it by hand. Prefer the marked conversation
+     * scrollport; older hosts scroll the chat root itself, so fall back to the
+     * first ancestor that really contains turn rows.
+     */
+    function conversationScroller(element) {
+      const marked = element.closest('[data-conversation-scroll]');
+      // The marker is authoritative even when the transcript is currently
+      // shorter than its frame: there is simply nothing to move in that case.
+      if (marked != null) return marked;
+      const candidates = [];
+      for (let node = element.parentElement; node != null; node = node.parentElement) {
+        if (scrollsVertically(node)) candidates.push(node);
+      }
+      const containing = candidates.filter((node) => node.querySelector('[data-chat-turn]') !== null);
+      // Outermost, not innermost: a nested group body also contains turn rows,
+      // but moving it alone is exactly the dead jump this function prevents.
+      return containing[containing.length - 1] ?? candidates[candidates.length - 1] ?? null;
+    }
+
+    /** Scrollports between `element` and `stop`, innermost first. */
+    function innerScrollers(element, stop) {
+      const scrollers = [];
+      for (let node = element.parentElement; node != null && node !== stop; node = node.parentElement) {
+        if (scrollsVertically(node)) scrollers.push(node);
+      }
+      return scrollers;
+    }
+
+    /**
+     * The smallest laid-out element that contains the quoted words.
+     *
+     * A message can keep a second, hidden copy of its text (a collapsed
+     * reasoning body, a source block). Picking the smallest match outright can
+     * land on that copy, which has no box and therefore cannot be scrolled to.
+     * Prefer the smallest match that actually has a box; fall back to the
+     * smallest hidden one so a later `beforematch` reveal can still use it.
+     */
+    function findFocus(target, needle) {
+      if (needle === '') return target;
+      let bestVisible = null;
+      let bestVisibleLength = Number.POSITIVE_INFINITY;
+      let bestHidden = null;
+      let bestHiddenLength = Number.POSITIVE_INFINITY;
+      for (const element of target.querySelectorAll('*')) {
+        const text = String(element.textContent ?? '').replace(/\s+/g, '');
+        if (!text.includes(needle)) continue;
+        const length = text.length;
+        const rect = element.getBoundingClientRect();
+        const visible = rect.width > 0 && rect.height > 0;
+        if (visible) {
+          if (length < bestVisibleLength) {
+            bestVisible = element;
+            bestVisibleLength = length;
+          }
+        } else if (length < bestHiddenLength) {
+          bestHidden = element;
+          bestHiddenLength = length;
+        }
+      }
+      return bestVisible ?? bestHidden ?? target;
+    }
+
+    /** Fold curly quotes so a rendered heading and the selected text compare equal. */
+    function foldQuoteChar(character) {
+      if (character === '“' || character === '”') return '"';
+      if (character === '‘' || character === '’') return "'";
+      return character;
+    }
+
+    /**
+     * A Range over the quoted words themselves.
+     *
+     * The element heuristic above finds the smallest box that contains a
+     * quote, but two quotes in the same long message often share one Markdown
+     * container. Without a range, both land on the container's first line and
+     * the later one looks like it did not move. Walking text nodes lets the
+     * same jump land on the exact line, and also tolerates quotes split across
+     * inline formatting.
+     */
+    function findTextRange(target, needle) {
+      if (needle === '' || typeof document.createTreeWalker !== 'function') return null;
+      try {
+        const text = [];
+        const map = [];
+        const walker = document.createTreeWalker(target, 4 /* NodeFilter.SHOW_TEXT */);
+        while (walker.nextNode()) {
+          const node = walker.currentNode;
+          const value = node.nodeValue ?? '';
+          for (let offset = 0; offset < value.length; offset += 1) {
+            const character = value[offset];
+            if (/\s/.test(character)) continue;
+            text.push(foldQuoteChar(character));
+            map.push({ node, offset });
+          }
+        }
+        let wanted = '';
+        for (let offset = 0; offset < needle.length; offset += 1) {
+          const character = needle[offset];
+          if (/\s/.test(character)) continue;
+          wanted += foldQuoteChar(character);
+        }
+        const whole = text.join('');
+        const makeRange = (at) => {
+          const start = map[at];
+          const end = map[at + wanted.length - 1];
+          if (start == null || end == null) return null;
+          const range = document.createRange();
+          range.setStart(start.node, start.offset);
+          range.setEnd(end.node, end.offset + 1);
+          return range;
+        };
+        let first = null;
+        for (let at = whole.indexOf(wanted); at >= 0; at = whole.indexOf(wanted, at + 1)) {
+          const range = makeRange(at);
+          if (range == null) continue;
+          first ??= range;
+          // A message can keep a hidden copy ahead of the visible reply; the
+          // hidden range has no box, so prefer the first occurrence that does.
+          const rect = range.getBoundingClientRect();
+          if (rect.width > 0 && rect.height > 0) return range;
+        }
+        return first;
+      } catch {
+        // Range measurement is an enhancement; an engine that refuses it still
+        // gets the element-level jump.
+        return null;
+      }
+    }
+
+    /** The box to align: the quoted range when it has a real box. */
+    function measureOf(range, focus) {
+      if (range != null) {
+        const rect = range.getBoundingClientRect();
+        if (rect.width > 0 && rect.height > 0) return range;
+      }
+      return focus;
+    }
+
+    /** Scroll every box that clips `focus`, then the conversation itself. */
+    function revealFocus(scroller, focus, range, gap) {
+      const measure = measureOf(range, focus);
+      for (const box of innerScrollers(focus, scroller)) alignInScroller(box, measure, gap);
+      alignInScroller(scroller, measure, gap);
+    }
+
+    /** Put the measured box `gap` pixels below the top edge of `scroller`. */
+    function alignInScroller(scroller, measure, gap) {
+      if (scroller == null || measure == null) return 0;
+      const connected = measure.startContainer ? measure.startContainer.isConnected : measure.isConnected;
+      if (connected === false) return 0;
+      const rect = measure.getBoundingClientRect();
+      if (rect.width === 0 && rect.height === 0) return 0;
+      const frame = scroller.getBoundingClientRect();
+      const delta = rect.top - frame.top - gap;
+      if (delta !== 0) scroller.scrollTop += delta;
+      return delta;
+    }
+
     /**
      * Break the transcript's tail-follow before a programmatic scroll.
      *
      * The chat re-pins itself to the tail while it believes the user is not
-     * driving, and a one-pixel self-scroll is not a signal it accepts — only a
-     * real wheel gesture flips it, which is why scrolling by hand used to be
-     * required before an upward jump would stick. A synthetic wheel event is
-     * that gesture as far as its listener is concerned.
-     *
-     * @returns the scroll container, for a direct-scroll fallback.
+     * driving. Older hosts flip that intent on a wheel gesture; newer ones stop
+     * a running follow animation on it and then decide from the next sampled
+     * reader position. A synthetic wheel is both gestures as far as their
+     * listeners are concerned. The one-pixel nudge gives even an old listener
+     * the scroll event it may be waiting for; the jump overwrites it at once.
      */
-    function releaseTail(element) {
-      let node = element.parentElement;
-      while (node != null) {
-        const style = window.getComputedStyle(node);
-        if (/(auto|scroll)/.test(style.overflowY) && node.scrollHeight > node.clientHeight) {
-          try {
-            node.dispatchEvent(
-              new WheelEvent('wheel', {
-                deltaY: -120,
-                deltaMode: 0,
-                bubbles: true,
-                cancelable: true,
-                view: window,
-              }),
-            );
-          } catch {
-            /* older engines: the nudge below still runs */
-          }
-          node.scrollTop -= 1;
-          return node;
-        }
-        node = node.parentElement;
+    function releaseTail(scroller) {
+      if (scroller == null) return;
+      try {
+        scroller.dispatchEvent(
+          new WheelEvent('wheel', {
+            deltaY: -120,
+            deltaMode: 0,
+            bubbles: true,
+            cancelable: true,
+            view: window,
+          }),
+        );
+      } catch {
+        /* older engines: the nudge below still runs */
       }
-      return null;
+      scroller.scrollTop -= 1;
+    }
+
+    /**
+     * Make a host that samples reader movement acknowledge the new position
+     * now. Its reader timer is half a second long, and a resize or content
+     * commit in that window re-pins the tail before the jump is accepted; a
+     * synthetic scroll followed by scrollend flushes the same sample at once.
+     */
+    function forceReaderSample(scroller) {
+      if (scroller == null) return;
+      try {
+        scroller.dispatchEvent(new Event('scroll'));
+        scroller.dispatchEvent(new Event('scrollend', { bubbles: true }));
+      } catch {
+        /* hosts without scrollend still sample on their own timer */
+      }
     }
 
     /** The「load earlier」control, when the transcript is showing one. */
@@ -2661,6 +2859,69 @@ return { oneLine, labelOf, createNode, addQuestion, addQuote, removeQuestion, ma
         if (text === '加载更早' || /^loadealier$/i.test(text) || /^loadearlier$/i.test(text)) {
           return button;
         }
+      }
+      return null;
+    }
+
+    /** CSS-escape a value for an attribute selector. */
+    function cssEscape(value) {
+      return typeof CSS !== 'undefined' && typeof CSS.escape === 'function'
+        ? CSS.escape(value)
+        : String(value).replace(/["\\]/g, '\\$&');
+    }
+
+    /**
+     * The rendered row a stored anchor names.
+     *
+     * A step can be mounted twice — its reasoning and its response are separate
+     * wrappers with the same `data-chat-node-key`. Returning the first match
+     * therefore sends a quote selected from the response to the reasoning copy,
+     * where the text is either absent or on another line. Pick the row that
+     * actually contains the quote, preferring a visible response wrapper.
+     */
+    function findAnchorTarget(anchor, needle) {
+      if (anchor == null) return null;
+      if (anchor.anchorKey != null) {
+        const exact = document.querySelector(
+          `[data-chat-anchor-key="${cssEscape(anchor.anchorKey)}"]`,
+        );
+        if (exact != null) return exact;
+      }
+      const selectors = [];
+      if (anchor.nodeKey != null) {
+        selectors.push(`[data-chat-node-key="${cssEscape(anchor.nodeKey)}"]`);
+      }
+      if (anchor.turn != null) {
+        selectors.push(`[data-chat-turn="${cssEscape(String(anchor.turn))}"]`);
+      }
+      let best = null;
+      let bestRank = -1;
+      for (const selector of selectors) {
+        for (const row of document.querySelectorAll(selector)) {
+          const text = String(row.textContent ?? '').replace(/\s+/g, '');
+          if (needle !== '' && !text.includes(needle)) continue;
+          const rect = row.getBoundingClientRect();
+          const visible = rect.width > 0 && rect.height > 0;
+          const part = row.getAttribute('data-chat-group-part');
+          // The response wrapper is the canonical text; reasoning is a process
+          // copy that is often hidden or scrolled elsewhere. Prefer response
+          // first, then no group part, then reasoning; visibility breaks ties.
+          const rank = (part === 'response' ? 20 : part == null ? 10 : 0) + (visible ? 5 : 0);
+          if (rank > bestRank) {
+            best = row;
+            bestRank = rank;
+          }
+        }
+      }
+      if (best != null) return best;
+      // Nothing contains the quote (empty selection or a re-rendered row):
+      // keep the old first-match behavior, but still prefer the response copy.
+      for (const selector of selectors) {
+        for (const row of document.querySelectorAll(selector)) {
+          if (row.getAttribute('data-chat-group-part') === 'response') return row;
+          best ??= row;
+        }
+        if (best != null) return best;
       }
       return null;
     }
@@ -2679,53 +2940,111 @@ return { oneLine, labelOf, createNode, addQuestion, addQuote, removeQuestion, ma
      */
     function locateAnchor(anchor, quote) {
       if (anchor == null) return false;
-      const escape = (value) =>
-        typeof CSS !== 'undefined' && typeof CSS.escape === 'function'
-          ? CSS.escape(value)
-          : String(value).replace(/["\\]/g, '\\$&');
-      const selector =
-        anchor.nodeKey != null
-          ? `[data-chat-node-key="${escape(anchor.nodeKey)}"]`
-          : anchor.turn != null
-            ? `[data-chat-turn="${escape(String(anchor.turn))}"]`
-            : null;
-      if (selector === null) return 'no-anchor';
-      const target = document.querySelector(selector);
+      // A new jump supersedes the previous landing loop, including the next
+      // passage of the same node when the reader double-clicks again quickly.
+      if (typeof LOCATE_CANCEL === 'function') LOCATE_CANCEL();
+      const needle = String(quote ?? '').replace(/\s+/g, '');
+      let target = findAnchorTarget(anchor, needle);
       // Not in the DOM: either the row is inside an unloaded older page, or the
       // list is mid-render. The caller retries, then tells the user which it is.
       if (target == null) return 'missing';
 
-      const needle = String(quote ?? '').replace(/\s+/g, '');
-      let focus = target;
-      if (needle !== '') {
-        let best = null;
-        let bestLength = Number.POSITIVE_INFINITY;
-        for (const element of target.querySelectorAll('*')) {
-          const text = String(element.textContent ?? '').replace(/\s+/g, '');
-          if (text.length >= bestLength || !text.includes(needle)) continue;
-          best = element;
-          bestLength = text.length;
+      let focus = findFocus(target, needle);
+      let range = findTextRange(target, needle);
+
+      // A completed turn folds its process rows with `hidden="until-found"`.
+      // The host reveals such a subtree when the browser's find-in-page says
+      // `beforematch`; the same signal opens it for this jump. Without it the
+      // row has no box to align and the jump silently lands nowhere. Nested
+      // folds need one signal per layer.
+      let folded = focus.closest('[hidden]');
+      while (folded != null) {
+        try {
+          folded.dispatchEvent(new Event('beforematch', { bubbles: true }));
+        } catch {
+          /* older engines: the row simply stays folded */
         }
-        if (best != null) focus = best;
+        const parent = folded.parentElement;
+        folded = parent == null ? null : parent.closest('[hidden]');
       }
 
       try {
-        // Align the row to the top of the transcript with a small gap, in ONE
-        // write: asking the browser to align and then correcting by 8px is two
-        // visible movements. Setting scrollTop by the measured error is one.
-        // The re-assertions repeat the same single write, so a pass that already
-        // measures as correct writes zero and nothing moves.
+        // Align the quoted line to the top of the transcript with a small gap.
+        // The conversation viewport is scrolled last; any inner scrollport
+        // between the line and the transcript (an open process-group body, a
+        // capped code block) is scrolled first so both land in one gesture.
         const TOP_GAP = 8;
-        const scroller = releaseTail(focus);
-        const reveal = (remaining) => {
-          if (!focus.isConnected || scroller == null) return;
-          const rect = focus.getBoundingClientRect();
-          const frame = scroller.getBoundingClientRect();
-          const delta = rect.top - frame.top - TOP_GAP;
-          if (delta !== 0) scroller.scrollTop += delta;
-          if (remaining > 0) window.setTimeout(() => reveal(remaining - 1), 140);
+        const scroller = conversationScroller(target);
+        // No scrollport at all: the transcript fits its frame, so the row is
+        // already where a jump would put it.
+        if (scroller == null) return 'ok';
+
+        releaseTail(scroller);
+        const before = scroller.scrollTop;
+        revealFocus(scroller, focus, range, TOP_GAP);
+        // Only force a sample when the viewport actually moved: a synthetic
+        // scroll on an unchanged scrollport would look like reader movement and
+        // could make the host drop or restore the tail against our intention.
+        const moved = Math.abs(scroller.scrollTop - before) > 0.5;
+        if (moved) forceReaderSample(scroller);
+
+        // History loading, folding, and font settling can all move the target
+        // after the first write. Re-assert the landing for a short while, but
+        // stop the moment the reader touches the transcript: a jump must never
+        // fight the hand that takes over.
+        let cancelled = false;
+        const stop = () => {
+          if (cancelled) return;
+          cancelled = true;
+          if (LOCATE_CANCEL === stop) LOCATE_CANCEL = null;
+          try {
+            scroller.removeEventListener('wheel', stop, true);
+            scroller.removeEventListener('pointerdown', stop, true);
+          } catch {
+            /* ignore */
+          }
         };
-        reveal(2);
+        LOCATE_CANCEL = stop;
+        try {
+          scroller.addEventListener('wheel', stop, true);
+          scroller.addEventListener('pointerdown', stop, true);
+        } catch {
+          /* ignore */
+        }
+        const settle = (remaining) => {
+          if (cancelled) return;
+          // React may replace the folded row when `beforematch` opens it; follow
+          // the anchor rather than a reference that just went stale.
+          const current = findAnchorTarget(anchor, needle);
+          if (current == null || !scroller.isConnected) {
+            stop();
+            return;
+          }
+          target = current;
+          focus = findFocus(target, needle);
+          range = findTextRange(target, needle);
+          revealFocus(scroller, focus, range, TOP_GAP);
+          if (remaining <= 0) {
+            stop();
+            return;
+          }
+          // A host still owning the tail needs another sample after its own
+          // re-pin; the later passes are spaced past its reader timer.
+          window.setTimeout(() => {
+            if (cancelled) return;
+            // Only a host that still advertises tail ownership needs the
+            // nudge: asking an already-released host to sample again could
+            // make it restore the tail the first sample had just dropped.
+            if (
+              remaining === 3 &&
+              scroller.querySelector('[data-chat-following-tail]') !== null
+            ) {
+              forceReaderSample(scroller);
+            }
+            settle(remaining - 1);
+          }, remaining > 3 ? 120 : 260);
+        };
+        window.setTimeout(() => settle(6), 140);
         return 'ok';
       } catch {
         return 'missing';

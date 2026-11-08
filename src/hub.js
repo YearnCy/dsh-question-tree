@@ -285,8 +285,21 @@ window.__ModuleLoader__.load({
       if (rect.width === 0 && rect.height === 0) return null;
       const nodeKey = row.getAttribute('data-chat-node-key');
       const turn = row.getAttribute('data-chat-turn');
+      // A step can be rendered more than once: its reasoning and its response
+      // are separate wrappers with the same node key. `anchorKey` names the
+      // exact wrapper that was selected, so a later jump can return to the
+      // response instead of the (usually hidden) reasoning copy.
+      const anchorKey = row.getAttribute('data-chat-anchor-key');
+      const groupPart = row.getAttribute('data-chat-group-part');
       const anchor =
-        nodeKey == null && turn == null ? null : { nodeKey: nodeKey ?? null, turn: turn ?? null };
+        nodeKey == null && turn == null
+          ? null
+          : {
+              nodeKey: nodeKey ?? null,
+              turn: turn ?? null,
+              anchorKey: anchorKey ?? null,
+              groupPart: groupPart ?? null,
+            };
       // The live Range and row ride along: the bar re-measures the selection
       // every animation frame so it follows scrolling as tightly as the host's
       // own pill does, which keeps its own selection range for the same reason.
@@ -305,9 +318,11 @@ window.__ModuleLoader__.load({
           ? CSS.escape(value)
           : String(value).replace(/["\\]/g, '\\$&');
       const selector =
-        anchor.nodeKey != null
-          ? `[data-chat-node-key="${escape(anchor.nodeKey)}"]`
-          : anchor.turn != null
+        anchor.anchorKey != null
+          ? `[data-chat-anchor-key="${escape(anchor.anchorKey)}"]`
+          : anchor.nodeKey != null
+            ? `[data-chat-node-key="${escape(anchor.nodeKey)}"]`
+            : anchor.turn != null
             ? `[data-chat-turn="${escape(String(anchor.turn))}"]`
             : null;
       if (selector === null) return false;

@@ -8,7 +8,11 @@
 import { readFile, writeFile } from 'node:fs/promises';
 
 const here = new URL('./', import.meta.url);
-const read = (relative) => readFile(new URL(relative, here), 'utf8');
+// Sources are checked out with the platform's line endings (Git for Windows
+// defaults to CRLF), while the wrapper markers below are written in LF. Read
+// both the same way so a clone builds on Windows and on POSIX alike.
+const read = async (relative) =>
+  (await readFile(new URL(relative, here), 'utf8')).replace(/\r\n/g, '\n');
 
 const hubSrc = await read('src/hub.js');
 const treeSrc = await read('src/tree.js');
