@@ -171,6 +171,101 @@ window.__ModuleLoader__.load({
       return 'failed';
     }
 
+    /**
+     * The composer handle for one session, resolved from the Host instead of
+     * from a rendered slot.
+     *
+     * The dock bridge only exists while a composer is mounted, and a slot whose
+     * props changed shape would leave the map empty — the send would then fall
+     * through to the clipboard without anyone noticing. The Host's own input
+     * resolver answers for any retained session, so it is the dependable path.
+     *
+     * @returns the session input facade, or null when it cannot be resolved.
+     */
+    async function inputViaHost(ctx, sessionId) {
+      try {
+        const conversation =
+          typeof ctx.get === 'function' ? ctx.get('conversation') : ctx.conversation;
+        const resolver = conversation == null ? null : conversation.input;
+        if (resolver == null || typeof resolver.for !== 'function') return null;
+        const scope = await scopeOf(ctx, sessionId);
+        if (scope == null) return null;
+        return resolver.for(scope) ?? null;
+      } catch {
+        return null;
+      }
+    }
+
+    /**
+     * Pull one older transcript page through the Host.
+     *
+     * Clicking the「加载更早」button is a DOM guess that stops working the moment
+     * the control is labelled differently or lives in another view; the
+     * conversation face knows how to page for any session, so a jump asks it
+     * first and only falls back to the button.
+     *
+     * @returns whether a page was requested.
+     */
+    async function loadOlderVia(ctx, sessionId) {
+      if (ctx == null) return false;
+      try {
+        const conversation =
+          typeof ctx.get === 'function' ? ctx.get('conversation') : ctx.conversation;
+        if (conversation == null || typeof conversation.loadOlder !== 'function') return false;
+        const scope = await scopeOf(ctx, sessionId);
+        if (scope == null) return false;
+        await scope.conversation.loadOlder();
+        return true;
+      } catch {
+        return false;
+      }
+    }
+
+    /** Copy text, reporting whether the clipboard accepted it. */
+    async function copyText(text) {
+      try {
+        if (navigator.clipboard && typeof navigator.clipboard.writeText === 'function') {
+          await navigator.clipboard.writeText(text);
+          return true;
+        }
+      } catch {
+        /* fall through */
+      }
+      return false;
+    }
+
+    /** Put text on the draft and submit it through one facade. */
+    function submitThrough(api, text) {
+      if (api == null) return false;
+      const setDraft = api.setDraft ?? (api.input && api.input.setDraft) ?? api.setText;
+      const submit = api.submit ?? api.send ?? (api.input && api.input.submit);
+      try {
+        if (typeof setDraft === 'function') setDraft.call(api, text);
+      } catch {
+        /* the draft may refuse; submit anyway */
+      }
+      if (typeof submit !== 'function') return false;
+      try {
+        submit.call(api);
+        return true;
+      } catch {
+        return false;
+      }
+    }
+
+    /**
+     * Send one question: the mounted bridge first, the Host's resolver second,
+     * the clipboard last.
+     *
+     * @returns 'sent' | 'copied' | 'filled'.
+     */
+    async function dispatchText(ctx, sessionId, text) {
+      if (submitThrough(INPUT.get(sessionId), text)) return 'sent';
+      const resolved = ctx == null ? null : await inputViaHost(ctx, sessionId);
+      if (submitThrough(resolved, text)) return 'sent';
+      return (await copyText(text)) ? 'copied' : 'filled';
+    }
+
     /** Type text into the composer and try to submit it. */
     function send(sessionId, text) {
       const api = INPUT.get(sessionId);
@@ -839,6 +934,9 @@ window.__ModuleLoader__.load({
       locate,
       insertText,
       send,
+      dispatch: (sessionId, text) => dispatchText(HUB_CTX, sessionId, text),
+      loadOlder: (sessionId) => loadOlderVia(HUB_CTX, sessionId),
+      session: () => LAST_SESSION,
       insertChip: (ctx, sessionId, token) => insertChip(ctx, sessionId, token),
     };
 
@@ -1174,10 +1272,15 @@ function markQuestionSent(nodes, questionId, sentAt) {
  * A turn that finished before a question was sent cannot answer it, so the
  * comparison is on time, not on count.
  *
+ * @param nodes - the forest.
+ * @param time - the finishing turn's timestamp.
+ * @param options - `understand: true` also flips each node that just received
+ *   its answer to understood, which is the「答完就算懂了」behaviour.
  * @returns `{ nodes, changed }`; unchanged nodes keep their reference.
  */
-function markAnswered(nodes, time) {
+function markAnswered(nodes, time, options) {
   const at = Number(time);
+  const understand = options != null && options.understand === true;
   if (!Number.isFinite(at) || at <= 0) return { nodes: nodes ?? [], changed: false };
   let changed = false;
   const next = (nodes ?? []).map((node) => {
@@ -1192,7 +1295,10 @@ function markAnswered(nodes, time) {
     });
     if (!touched) return node;
     changed = true;
-    return { ...node, questions: updated };
+    // Its answer just landed: unless the user already said this one is clear,
+    // treat「asked and answered」as「understood」. They can still click it back.
+    const status = understand && node.status === STATUS_UNCLEAR ? STATUS_CLEAR : node.status;
+    return { ...node, status, questions: updated };
   });
   return { nodes: changed ? next : (nodes ?? []), changed };
 }
@@ -1442,6 +1548,7 @@ return { oneLine, labelOf, createNode, addQuestion, addQuote, removeQuestion, ma
 })();
 
     const ID = '@local/question-tree';
+    const VIEW_ID = 'question-tree';
     const KIND = 'question-tree';
     const NS = 'questionTree';
     const STORE_PREFIX = 'dsh.question-tree.v4.';
@@ -1454,6 +1561,7 @@ return { oneLine, labelOf, createNode, addQuestion, addQuote, removeQuestion, ma
       'chip.action': '树形提问',
       'chip.toComposer': '添加到对话',
       'actions.title': '划取动作',
+      'actions.autoUnderstand': '回答后自动标记为“懂了”',
       'chip.hint': '挂在「{parent}」下；按住 Alt 变成根节点',
       'empty.title': '还没有节点',
       'empty.body': '在对话里划取一段文字，点浮出的「树形提问」，然后在节点下面提问。',
@@ -1464,6 +1572,11 @@ return { oneLine, labelOf, createNode, addQuestion, addQuote, removeQuestion, ma
       'ask.placeholder': '在这里提问，Enter 发送，Esc 取消',
       'view.list': '列表',
       'view.graph': '图',
+      'view.listHint': '列表视图：一条一条往下排',
+      'view.graphHint': '分支图视图：横向铺开，看清谁从谁长出来',
+      'hint.graph': '这棵树已经分叉了，切到「图」能一眼看清分支',
+      'hint.graphSwitch': '切到图',
+      'hint.graphDismiss': '知道了',
       'ask.send': '发送',
       'ask.cancel': '取消',
       'state.waiting': '待回答',
@@ -1486,6 +1599,7 @@ return { oneLine, labelOf, createNode, addQuestion, addQuote, removeQuestion, ma
       'chip.action': 'Ask in tree',
       'chip.toComposer': 'Add to composer',
       'actions.title': 'Selection actions',
+      'actions.autoUnderstand': 'Mark understood once answered',
       'chip.hint': 'Under「{parent}」; hold Alt for a root node',
       'empty.title': 'No nodes yet',
       'empty.body': 'Select a phrase in the conversation, click「Ask in tree」, then ask under the node.',
@@ -1496,6 +1610,11 @@ return { oneLine, labelOf, createNode, addQuestion, addQuote, removeQuestion, ma
       'ask.placeholder': 'Type your question, Enter to send, Esc to cancel',
       'view.list': 'List',
       'view.graph': 'Graph',
+      'view.listHint': 'List view: one row after another',
+      'view.graphHint': 'Branch graph: laid out sideways, so you see what grew from what',
+      'hint.graph': 'This tree has branched — the graph view shows it at a glance',
+      'hint.graphSwitch': 'Show graph',
+      'hint.graphDismiss': 'Got it',
       'ask.send': 'Send',
       'ask.cancel': 'Cancel',
       'state.waiting': 'waiting',
@@ -1542,6 +1661,10 @@ return { oneLine, labelOf, createNode, addQuestion, addQuote, removeQuestion, ma
      */
     const LOCATE_CURSOR = new Map();
     const INPUT = new Map();
+    /** The hub service handed over at apply time; owns the composer paths. */
+    let HUB = null;
+    /** Context handed over at apply time, for panels rendered outside a slot. */
+    let CTX = null;
     // A jump re-asserts its landing for a moment, so a new jump (the next
     // passage of the same node, or another node) must cancel the previous
     // loop; otherwise the two would scroll the transcript against each other.
@@ -1625,6 +1748,42 @@ return { oneLine, labelOf, createNode, addQuestion, addQuote, removeQuestion, ma
 
     /** Per-action on/off switches, the user-facing half of the selection hub. */
     const ACTION_SETTINGS_KEY = 'dsh.question-tree.actions';
+    /** 「answered means understood」 — on unless the user turns it off. */
+    const AUTO_UNDERSTAND_KEY = 'dsh.question-tree.autoUnderstand';
+    /** Set once the graph view has actually been opened, so the dot stops. */
+    const GRAPH_SEEN_KEY = 'dsh.question-tree.graphSeen';
+
+    function readAutoUnderstand() {
+      try {
+        return window.localStorage.getItem(AUTO_UNDERSTAND_KEY) !== '0';
+      } catch {
+        return true;
+      }
+    }
+
+    function readGraphSeen() {
+      try {
+        return window.localStorage.getItem(GRAPH_SEEN_KEY) === '1';
+      } catch {
+        return false;
+      }
+    }
+
+    function writeGraphSeen() {
+      try {
+        window.localStorage.setItem(GRAPH_SEEN_KEY, '1');
+      } catch {
+        /* storage may be full or disabled */
+      }
+    }
+
+    function writeAutoUnderstand(value) {
+      try {
+        window.localStorage.setItem(AUTO_UNDERSTAND_KEY, value ? '1' : '0');
+      } catch {
+        /* storage may be full or disabled */
+      }
+    }
 
     function readActionSettings() {
       try {
@@ -1672,10 +1831,25 @@ return { oneLine, labelOf, createNode, addQuestion, addQuote, removeQuestion, ma
       }
     }
 
+    /**
+     * The session the tree belongs to.
+     *
+     * A mounted panel reports it, but the panel is not always mounted — the
+     * sidebar tab may be closed and the View tab may not have been opened yet.
+     * The composer bridge always knows the on-screen session, so the tree keeps
+     * working from the selection bar before any panel has ever rendered.
+     */
+    function sessionNow() {
+      if (CURRENT.sessionId != null) return CURRENT.sessionId;
+      return HUB != null && typeof HUB.session === 'function' ? HUB.session() : null;
+    }
+
     function nodesNow() {
-      return readNodes(CURRENT.sessionId);
-    }    function commit(nodes) {
-      writeNodes(CURRENT.sessionId, nodes);
+      return readNodes(sessionNow());
+    }
+
+    function commit(nodes) {
+      writeNodes(sessionNow(), nodes);
       BUS.bump();
     }
 
@@ -1718,6 +1892,10 @@ return { oneLine, labelOf, createNode, addQuestion, addQuote, removeQuestion, ma
      * @returns 'sent' | 'filled' | 'copied'.
      */
     async function dispatch(sessionId, text) {
+      // The hub knows every way into the composer (mounted bridge, the Host's
+      // input resolver, clipboard). Its answer is authoritative when present;
+      // the local path below is only for a split build without the hub.
+      if (HUB != null && typeof HUB.dispatch === 'function') return HUB.dispatch(sessionId, text);
       const api = INPUT.get(sessionId);
       if (api == null) return (await copyToClipboard(text)) ? 'copied' : 'filled';
       const setDraft = api.setDraft ?? (api.input && api.input.setDraft) ?? api.setText;
@@ -2012,7 +2190,7 @@ return { oneLine, labelOf, createNode, addQuestion, addQuote, removeQuestion, ma
       }, []);
 
       if (chip == null) return null;
-      if (CURRENT.sessionId == null) return null;
+      if (sessionNow() == null) return null;
 
       const actionSettings = readActionSettings();
       const actions = SELECTION_ACTIONS.filter((item) => isActionEnabled(actionSettings, item.id)).sort(
@@ -2242,6 +2420,79 @@ return { oneLine, labelOf, createNode, addQuestion, addQuote, removeQuestion, ma
       );
     }
 
+    /**
+     * Hover detail we control.
+     *
+     * The native `title` tooltip waits about a second before appearing and
+     * cannot be configured, which is why reading a node's full text felt slow.
+     * This draws the same text after a short delay, positioned under the row.
+     */
+    function Tip(props) {
+      const [at, setAt] = React.useState(null);
+      const timer = React.useRef(0);
+      const cancel = () => {
+        if (timer.current !== 0) {
+          window.clearTimeout(timer.current);
+          timer.current = 0;
+        }
+      };
+      const enter = (event) => {
+        const element = event.currentTarget;
+        cancel();
+        timer.current = window.setTimeout(() => {
+          timer.current = 0;
+          const rect = element.getBoundingClientRect();
+          setAt({ x: rect.left, y: rect.bottom });
+        }, 140);
+      };
+      const leave = () => {
+        cancel();
+        setAt(null);
+      };
+      const text = props.text ?? '';
+      return h(
+        'span',
+        {
+          className: props.className,
+          style: props.style,
+          onMouseEnter: enter,
+          onMouseLeave: leave,
+          onDoubleClick: props.onDoubleClick,
+          onClick: props.onClick,
+        },
+        props.children,
+        at == null || text === ''
+          ? null
+          : h(
+              'div',
+              {
+                'data-question-tree-tip': true,
+                style: {
+                  position: 'fixed',
+                  left: Math.max(8, Math.min(at.x, window.innerWidth - 388)),
+                  top: Math.min(at.y + 6, window.innerHeight - 80),
+                  maxWidth: 380,
+                  maxHeight: 260,
+                  overflow: 'hidden',
+                  padding: '6px 8px',
+                  borderRadius: 6,
+                  border: '1px solid var(--dsw-alias-border-l3, #4a5057)',
+                  background: 'var(--dsw-alias-bg-l3, #232a31)',
+                  color: 'var(--dsw-alias-label-primary, #e6e6e6)',
+                  boxShadow: '0 10px 28px rgba(0,0,0,0.45)',
+                  fontSize: 11,
+                  lineHeight: '17px',
+                  whiteSpace: 'pre-wrap',
+                  wordBreak: 'break-word',
+                  pointerEvents: 'none',
+                  zIndex: 2147482600,
+                },
+              },
+              text,
+            ),
+      );
+    }
+
     function Row({ row, t, selected, onSelect, onLocate, onToggle, onAsk, onRemove }) {
       const [hover, setHover] = React.useState(false);
       const node = row.node;
@@ -2335,7 +2586,7 @@ return { oneLine, labelOf, createNode, addQuestion, addQuote, removeQuestion, ma
               },
             }),
         h(
-          'span',
+          Tip,
           {
             style: {
               flex: 1,
@@ -2347,13 +2598,13 @@ return { oneLine, labelOf, createNode, addQuestion, addQuote, removeQuestion, ma
               opacity: question || unclear ? 1 : 0.65,
               textDecoration: question ? 'none' : unclear ? 'none' : 'line-through',
             },
-            // Full text in the tooltip, and each passage keeps its own 「」 —
-            // the joined string would read as one continuous excerpt.
-            title: question
+            // Each passage keeps its own 「」 — the joined string would read as
+            // one continuous excerpt.
+            text: question
               ? QTModel.labelOf(node)
               : (Array.isArray(node.quotes) && node.quotes.length > 0 ? node.quotes : [node.quote])
                   .map((item) => `「${item}」`)
-                  .join(''),
+                  .join('\n'),
           },
           question ? QTModel.oneLine(node.text, 80) : displayQuote(node, 56),
         ),
@@ -2420,11 +2671,11 @@ return { oneLine, labelOf, createNode, addQuestion, addQuote, removeQuestion, ma
      * all come for free, and there is no measuring to get wrong.
      */
     const GRAPH_CSS = `
-.qt-g-forest{display:flex;flex-direction:column;gap:14px;padding:4px 6px 24px}
-.qt-g-branch{display:flex;align-items:center}
-.qt-g-kids{display:flex;flex-direction:column;gap:8px;position:relative;padding-left:22px;margin-left:12px}
+.qt-g-forest{display:flex;flex-direction:column;gap:14px;padding:4px 6px 24px;width:max-content;min-width:100%}
+.qt-g-branch{display:flex;align-items:center;flex:0 0 auto}
+.qt-g-kids{display:flex;flex-direction:column;gap:8px;position:relative;padding-left:22px;margin-left:12px;flex:0 0 auto}
 .qt-g-kids::before{content:'';position:absolute;left:0;top:14px;bottom:14px;border-left:1px solid var(--dsw-alias-border-l2,#2f343a)}
-.qt-g-kid{position:relative;display:flex;align-items:center}
+.qt-g-kid{position:relative;display:flex;align-items:center;flex:0 0 auto}
 .qt-g-kid::before{content:'';position:absolute;left:-22px;top:50%;width:18px;border-top:1px solid var(--dsw-alias-border-l2,#2f343a)}
 .qt-g-node{display:flex;align-items:center;gap:6px;flex-wrap:wrap;width:168px;flex:0 0 168px;box-sizing:border-box;padding:4px 8px;border-radius:8px;border:1px solid var(--dsw-alias-border-l2,#3a3f45);background:var(--dsw-alias-bg-module-platform,#1b1f23);cursor:default}
 .qt-g-node:hover{background:color-mix(in srgb, var(--dsw-alias-interactive-bg-hover,#2a2f35) 55%, transparent)}
@@ -2854,11 +3105,15 @@ return { oneLine, labelOf, createNode, addQuestion, addQuote, removeQuestion, ma
 
     /** The「load earlier」control, when the transcript is showing one. */
     function findLoadEarlier() {
+      // Copy differs by locale and by build, so match the visible text of every
+      // shipped translation rather than one exact string.
+      const LABELS = ['加载更早', '载入更早', '更早的消息'];
       for (const button of document.querySelectorAll('button')) {
+        if (button.disabled) continue;
         const text = String(button.textContent ?? '').replace(/\s+/g, '');
-        if (text === '加载更早' || /^loadealier$/i.test(text) || /^loadearlier$/i.test(text)) {
-          return button;
-        }
+        if (LABELS.some((label) => text === label)) return button;
+        if (/^(load|loading)(more|older|earlier)$/i.test(text)) return button;
+        if (/^(以前を読み込む|cargarantes|cargaranteriores)$/i.test(text)) return button;
       }
       return null;
     }
@@ -3070,12 +3325,62 @@ return { oneLine, labelOf, createNode, addQuestion, addQuote, removeQuestion, ma
       return `${head} +${passages.length - 2}`;
     }
 
+    // Chromium ignores most inline scrollbar styling, and an overlay scrollbar
+    // on a dark panel reads as "there is nothing below" — which is exactly the
+    // bug this fixes. A thin, always-visible bar makes the list obviously
+    // scrollable.
+    const SCROLL_CSS = `
+.qt-scroll{scrollbar-gutter:stable}
+.qt-scroll::-webkit-scrollbar{width:10px;height:10px}
+.qt-scroll::-webkit-scrollbar-track{background:transparent}
+.qt-scroll::-webkit-scrollbar-thumb{background:rgba(255,255,255,.28);border-radius:6px;border:2px solid transparent;background-clip:content-box}
+.qt-scroll::-webkit-scrollbar-thumb:hover{background:rgba(255,255,255,.5);background-clip:content-box}
+.qt-scroll::-webkit-scrollbar-corner{background:transparent}
+`;
+
     function TreePanel(props) {
       const info = props.questionTree ?? {};
       const t = info.t ?? t0;
       const sessionId = info.sessionId;
       const ctx = info.ctx;
       useVersion();
+      const scrollRef = React.useRef(null);
+
+      // Wheel has to be bound natively: React's delegated listener is passive,
+      // so a handler there cannot stop the page behind the popup from scrolling.
+      // The graph additionally turns the wheel sideways, because its depth grows
+      // to the right and a vertical wheel would never reach the deeper nodes.
+      React.useEffect(() => {
+        const element = scrollRef.current;
+        if (element == null) return undefined;
+        const onWheel = (event) => {
+          // Only the graph can be wider than the panel: the list clips its rows
+          // with `overflow-x: hidden`, where `scrollWidth > clientWidth` is
+          // still true but there is nothing to scroll sideways. Mapping the
+          // wheel there made the list move horizontally and never vertically.
+          const horizontal =
+            CURRENT.view === 'graph' && element.scrollWidth > element.clientWidth + 1;
+          if (horizontal) {
+            const step = event.deltaX !== 0 ? event.deltaX : event.deltaY;
+            const before = element.scrollLeft;
+            element.scrollLeft += step;
+            const moved = element.scrollLeft !== before;
+            if (!event.shiftKey) {
+              event.preventDefault();
+              return;
+            }
+            if (moved) {
+              event.preventDefault();
+              return;
+            }
+          }
+          const before = element.scrollTop;
+          element.scrollTop += event.deltaY;
+          if (element.scrollTop !== before) event.preventDefault();
+        };
+        element.addEventListener('wheel', onWheel, { passive: false });
+        return () => element.removeEventListener('wheel', onWheel);
+      });
 
       React.useEffect(() => {
         if (typeof sessionId !== 'string' || sessionId === '') return undefined;
@@ -3126,7 +3431,9 @@ return { oneLine, labelOf, createNode, addQuestion, addQuote, removeQuestion, ma
                 }
                 if (last <= 0) return;
                 const nodes = readNodes(sessionId);
-                const result = QTModel.markAnswered(nodes, last);
+                const result = QTModel.markAnswered(nodes, last, {
+                  understand: readAutoUnderstand(),
+                });
                 if (result.changed) {
                   writeNodes(sessionId, result.nodes);
                   BUS.bump();
@@ -3192,7 +3499,11 @@ return { oneLine, labelOf, createNode, addQuestion, addQuote, removeQuestion, ma
         const anchor = anchors[at];
         const quote = passages[at] ?? node.quote;
 
-        const attempt = (remaining) => {
+        // The quote may sit in an older page that this Session never loaded.
+        // Ask the Host for one page per round — the conversation face pages any
+        // session, the button only exists where the transcript happens to be
+        // mounted — and report the miss when the pages run out.
+        const attempt = async (remaining) => {
           const outcome = locateAnchor(anchor, quote);
           if (outcome === 'ok') return;
           if (outcome === 'no-anchor') {
@@ -3200,14 +3511,30 @@ return { oneLine, labelOf, createNode, addQuestion, addQuote, removeQuestion, ma
             return;
           }
           if (remaining > 0) {
-            const button = findLoadEarlier();
-            if (button != null) button.click();
-            window.setTimeout(() => attempt(remaining - 1), 220);
-            return;
+            let requested = false;
+            try {
+              requested =
+                HUB != null && typeof HUB.loadOlder === 'function'
+                  ? await HUB.loadOlder(sessionId)
+                  : false;
+            } catch {
+              requested = false;
+            }
+            if (!requested) {
+              const button = findLoadEarlier();
+              if (button != null) {
+                button.click();
+                requested = true;
+              }
+            }
+            if (requested) {
+              window.setTimeout(() => void attempt(remaining - 1), 260);
+              return;
+            }
           }
           say(t('flash.notLoaded'));
         };
-        attempt(6);
+        void attempt(12);
       };
       const rows = QTModel.flattenForest(nodes);
       const counts = QTModel.summarize(nodes);
@@ -3229,6 +3556,83 @@ return { oneLine, labelOf, createNode, addQuestion, addQuote, removeQuestion, ma
           text,
         );
 
+      // The switcher used to be two 10px text buttons in the corner, which
+      // nobody found. A segmented control reads as one obvious choice, and the
+      // unseen view keeps a dot until it has been looked at once.
+      const viewSwitch = h(
+        'span',
+        {
+          style: {
+            display: 'inline-flex',
+            alignItems: 'center',
+            gap: 2,
+            marginLeft: 6,
+            padding: 2,
+            borderRadius: 8,
+            border: '1px solid var(--dsw-alias-border-l2, #3a3f45)',
+            background: 'var(--dsw-alias-bg-l1, rgba(255,255,255,0.04))',
+          },
+        },
+        ...[
+          ['list', '☰', t('view.list'), t('view.listHint')],
+          ['graph', '⑂', t('view.graph'), t('view.graphHint')],
+        ].map(([value, icon, label, title]) => {
+          const active = CURRENT.view === value;
+          const unseen = value === 'graph' && !readGraphSeen() && active === false;
+          return h(
+            'button',
+            {
+              key: value,
+              type: 'button',
+              title,
+              'aria-pressed': active,
+              onClick: () => {
+                CURRENT.view = value;
+                if (value === 'graph') writeGraphSeen();
+                BUS.bump();
+              },
+              style: {
+                appearance: 'none',
+                border: 'none',
+                background: active
+                  ? 'var(--dsw-alias-interactive-bg-active, #353b43)'
+                  : 'transparent',
+                color: active
+                  ? 'var(--dsw-alias-label-primary, #f0f0f0)'
+                  : 'var(--dsw-alias-label-secondary, #b3b8bf)',
+                borderRadius: 6,
+                padding: '1px 7px',
+                font: 'inherit',
+                fontSize: 11,
+                lineHeight: '17px',
+                fontWeight: active ? 600 : 400,
+                cursor: 'pointer',
+                display: 'inline-flex',
+                alignItems: 'center',
+                gap: 3,
+                position: 'relative',
+              },
+            },
+            h('span', { 'aria-hidden': true, style: { fontSize: 11 } }, icon),
+            h('span', null, label),
+            unseen
+              ? h('span', {
+                  'aria-hidden': true,
+                  style: {
+                    position: 'absolute',
+                    top: 1,
+                    right: 1,
+                    width: 5,
+                    height: 5,
+                    borderRadius: 999,
+                    background: 'var(--dsw-alias-state-info-primary, #4c8dff)',
+                  },
+                })
+              : null,
+          );
+        }),
+      );
+
       const header = h(
         'div',
         {
@@ -3243,46 +3647,89 @@ return { oneLine, labelOf, createNode, addQuestion, addQuote, removeQuestion, ma
         counts.waiting === 0
           ? null
           : pill(`${counts.waiting} 待答`, 'var(--dsw-alias-label-secondary, #b3b8bf)'),
-        h(
-          'span',
-          { style: { display: 'flex', gap: 2, marginLeft: 4 } },
-          ...[
-            ['list', t('view.list')],
-            ['graph', t('view.graph')],
-          ].map(([value, label]) =>
-            h(
-              'button',
+        viewSwitch,
+      );
+
+      // A hint that only earns its place while it is true and unseen: as soon
+      // as the tree actually branches, the graph view becomes worth finding.
+      const childCount = new Map();
+      for (const node of nodes) {
+        if (node.parentId == null) continue;
+        childCount.set(node.parentId, (childCount.get(node.parentId) ?? 0) + 1);
+      }
+      const branching =
+        [...childCount.values()].some((count) => count >= 2) ||
+        nodes.filter((node) => node.parentId == null).length >= 2;
+      const graphHint =
+        branching && CURRENT.view === 'list' && !readGraphSeen()
+          ? h(
+              'div',
               {
-                key: value,
-                type: 'button',
-                onClick: () => {
-                  CURRENT.view = value;
-                  BUS.bump();
-                },
                 style: {
-                  appearance: 'none',
-                  border: '1px solid var(--dsw-alias-border-l2, #3a3f45)',
-                  background:
-                    CURRENT.view === value
-                      ? 'var(--dsw-alias-interactive-bg-hover, #2a2f35)'
-                      : 'transparent',
-                  color:
-                    CURRENT.view === value
-                      ? 'var(--dsw-alias-label-primary, #e6e6e6)'
-                      : 'var(--dsw-alias-label-tertiary, #8a8f98)',
+                  flexShrink: 0,
+                  display: 'flex',
+                  alignItems: 'center',
+                  gap: 6,
+                  margin: '0 10px 6px',
+                  padding: '5px 8px',
                   borderRadius: 6,
-                  padding: '0 6px',
-                  font: 'inherit',
-                  fontSize: 10,
+                  fontSize: 11,
                   lineHeight: '16px',
-                  cursor: 'pointer',
+                  color: 'var(--dsw-alias-label-secondary, #b3b8bf)',
+                  background: 'var(--dsw-alias-bg-l1, rgba(255,255,255,0.04))',
+                  border: '1px solid var(--dsw-alias-border-l2, #3a3f45)',
                 },
               },
-              label,
-            ),
-          ),
-        ),
-      );
+              h('span', { style: { flex: 1 } }, t('hint.graph')),
+              h(
+                'button',
+                {
+                  type: 'button',
+                  onClick: () => {
+                    CURRENT.view = 'graph';
+                    writeGraphSeen();
+                    BUS.bump();
+                  },
+                  style: {
+                    appearance: 'none',
+                    border: '1px solid var(--dsw-alias-border-l3, #4a5057)',
+                    background: 'var(--dsw-alias-interactive-bg-hover, #2a2f35)',
+                    color: 'var(--dsw-alias-label-primary, #e6e6e6)',
+                    borderRadius: 5,
+                    padding: '0 6px',
+                    font: 'inherit',
+                    fontSize: 11,
+                    lineHeight: '16px',
+                    cursor: 'pointer',
+                  },
+                },
+                t('hint.graphSwitch'),
+              ),
+              h(
+                'button',
+                {
+                  type: 'button',
+                  title: t('hint.graphDismiss'),
+                  onClick: () => {
+                    writeGraphSeen();
+                    BUS.bump();
+                  },
+                  style: {
+                    appearance: 'none',
+                    border: 'none',
+                    background: 'transparent',
+                    color: 'var(--dsw-alias-label-tertiary, #8a8f98)',
+                    cursor: 'pointer',
+                    font: 'inherit',
+                    fontSize: 13,
+                    lineHeight: '16px',
+                    padding: '0 2px',
+                  },
+                },
+                '×',
+              ),
+            )
+          : null;
 
       const submitQuestion = (quoteId, text, message) => {
         const before = readNodes(sessionId);
@@ -3407,6 +3854,25 @@ return { oneLine, labelOf, createNode, addQuestion, addQuote, removeQuestion, ma
       const registered =
         hub == null ? [] : typeof hub.available === 'function' ? hub.available() : hub.actions();
       const actionEnabled = (id) => (hub == null ? true : hub.isEnabled(id));
+      const autoUnderstand = readAutoUnderstand();
+      const switchRow = (key, label, checked, onChange) =>
+        h(
+          'label',
+          {
+            key,
+            style: {
+              display: 'flex',
+              alignItems: 'center',
+              gap: 4,
+              fontSize: 11,
+              lineHeight: '18px',
+              cursor: 'pointer',
+              opacity: checked ? 1 : 0.5,
+            },
+          },
+          h('input', { type: 'checkbox', checked, onChange, style: { margin: 0 } }),
+          label,
+        );
       const actionSection =
         registered.length === 0
           ? null
@@ -3425,42 +3891,67 @@ return { oneLine, labelOf, createNode, addQuestion, addQuote, removeQuestion, ma
                 t('actions.title'),
               ),
               ...registered.map((action) =>
-                h(
-                  'label',
-                  {
-                    key: action.id,
-                    style: {
-                      display: 'flex',
-                      alignItems: 'center',
-                      gap: 4,
-                      fontSize: 11,
-                      lineHeight: '18px',
-                      cursor: 'pointer',
-                      opacity: actionEnabled(action.id) ? 1 : 0.5,
-                    },
-                  },
-                  h('input', {
-                    type: 'checkbox',
-                    checked: actionEnabled(action.id),
-                    onChange: () => {
-                      if (hub == null) return;
-                      hub.setEnabled(action.id, !actionEnabled(action.id));
-                      BUS.bump();
-                    },
-                    style: { margin: 0 },
-                  }),
+                switchRow(
+                  action.id,
                   action.label(),
+                  actionEnabled(action.id),
+                  () => {
+                    if (hub == null) return;
+                    hub.setEnabled(action.id, !actionEnabled(action.id));
+                    BUS.bump();
+                  },
                 ),
+              ),
+              switchRow(
+                'auto-understand',
+                t('actions.autoUnderstand'),
+                autoUnderstand,
+                () => {
+                  writeAutoUnderstand(!autoUnderstand);
+                  BUS.bump();
+                },
               ),
             );
 
       return h(
         'div',
-        { style: { display: 'flex', flexDirection: 'column', height: '100%', minHeight: 0 } },
+        // `minWidth: 0` + full width keep a long quote from widening the whole
+        // panel: without it the header (counts, view switch) is pushed sideways
+        // and only reachable by scrolling, which is what the sidebar version
+        // never did.
+        {
+          style: {
+            display: 'flex',
+            flexDirection: 'column',
+            height: '100%',
+            width: '100%',
+            minWidth: 0,
+            minHeight: 0,
+          },
+        },
+        h('style', { dangerouslySetInnerHTML: { __html: SCROLL_CSS } }),
         header,
+        graphHint,
         h(
           'div',
-          { style: { flex: 1, minHeight: 0, overflow: 'auto', padding: '0 6px 16px' } },
+          {
+            ref: scrollRef,
+            className: 'qt-scroll',
+            style: {
+              flex: 1,
+              minHeight: 0,
+              minWidth: 0,
+              overflowY: 'auto',
+              // The branch graph grows to the right with depth, so it needs a
+              // horizontal scrollport; the list keeps its rows on one width.
+              overflowX: CURRENT.view === 'graph' ? 'auto' : 'hidden',
+              // No standard `scrollbar-width` / `scrollbar-color` here: once
+              // Chromium sees either of them it stops honouring the
+              // `::-webkit-scrollbar` rules below, and the bar collapsed to an
+              // invisible overlay thumb. The class owns the look instead.
+              padding: '0 6px 16px',
+            },
+          },
           content,
         ),
         actionSection,
@@ -3517,6 +4008,208 @@ return { oneLine, labelOf, createNode, addQuestion, addQuote, removeQuestion, ma
       return h(Boundary, null, h(TreePanel, props));
     }
 
+    /**
+     * Hover surface for the「问题树」tab.
+     *
+     * The tab itself is the shell's, and a page replaces the conversation —
+     * which is the opposite of what a jump back to a quote needs. So hovering
+     * the tab opens the same panel as a floating window over the transcript,
+     * and the reader can keep clicking nodes while the conversation stays put.
+     */
+    const DOCK = { sessionId: null, rect: null, hover: false, timer: 0, pointer: null };
+
+    /**
+     * Whether the pointer still sits on the tab or on the panel.
+     *
+     * Closing on a bare `mouseleave` is what made the panel flash away: the
+     * pointer leaves the tab before it reaches the panel, and a panel that has
+     * not been painted yet sends no `mouseenter` to cancel the timer. Asking
+     * the document where the pointer is settles it without guessing.
+     */
+    function pointerHoldsPanel() {
+      const pointer = DOCK.pointer;
+      if (pointer == null || typeof document.elementFromPoint !== 'function') return false;
+      const element = document.elementFromPoint(pointer.x, pointer.y);
+      if (element == null || typeof element.closest !== 'function') return false;
+      return element.closest('[data-question-tree-hover], [data-question-tree-tab]') != null;
+    }
+
+    function dockCloseSoon() {
+      if (DOCK.timer !== 0) window.clearTimeout(DOCK.timer);
+      const check = () => {
+        DOCK.timer = 0;
+        if (pointerHoldsPanel()) {
+          // Still inside: keep watching instead of closing under the pointer.
+          DOCK.timer = window.setTimeout(check, 160);
+          return;
+        }
+        DOCK.hover = false;
+        BUS.bump();
+      };
+      DOCK.timer = window.setTimeout(check, 260);
+    }
+
+    /** Binds to the shell-rendered tab, which this plugin does not own. */
+    function ViewTabHover() {
+      React.useEffect(() => {
+        const label = t0('type.label');
+        let bound = null;
+        const track = (event) => {
+          DOCK.pointer = { x: event.clientX, y: event.clientY };
+        };
+        document.addEventListener('mousemove', track, true);
+        const enter = () => {
+          if (bound == null) return;
+          const sessionId = CURRENT.sessionId ?? (HUB != null && HUB.session ? HUB.session() : null);
+          if (typeof sessionId !== 'string' || sessionId === '') return;
+          if (DOCK.timer !== 0) {
+            window.clearTimeout(DOCK.timer);
+            DOCK.timer = 0;
+          }
+          DOCK.sessionId = sessionId;
+          DOCK.rect = bound.getBoundingClientRect();
+          DOCK.hover = true;
+          BUS.bump();
+        };
+        const leave = () => dockCloseSoon();
+        const sync = () => {
+          let next = null;
+          for (const element of document.querySelectorAll('button, [role="tab"]')) {
+            if (String(element.textContent ?? '').trim() === label) {
+              next = element;
+              break;
+            }
+          }
+          if (next === bound) return;
+          if (bound != null) {
+            bound.removeEventListener('mouseenter', enter);
+            bound.removeEventListener('mouseleave', leave);
+          }
+          bound = next;
+          if (bound != null) {
+            bound.setAttribute('data-question-tree-tab', '');
+            bound.addEventListener('mouseenter', enter);
+            bound.addEventListener('mouseleave', leave);
+          }
+        };
+        sync();
+        const observer = new MutationObserver(sync);
+        try {
+          observer.observe(document.body, { childList: true, subtree: true });
+        } catch {
+          /* older engines: the bind still works for the first render */
+        }
+        return () => {
+          document.removeEventListener('mousemove', track, true);
+          try {
+            observer.disconnect();
+          } catch {
+            /* ignore */
+          }
+          if (bound != null) {
+            bound.removeEventListener('mouseenter', enter);
+            bound.removeEventListener('mouseleave', leave);
+          }
+        };
+      }, []);
+      return null;
+    }
+
+    function TreeHoverPanel() {
+      useVersion();
+      if (!DOCK.hover || DOCK.sessionId == null || DOCK.rect == null) return null;
+      const width = Math.min(430, window.innerWidth - 24);
+      const left = Math.min(Math.max(12, DOCK.rect.left - 4), window.innerWidth - width - 12);
+      const top = Math.min(DOCK.rect.bottom + 8, Math.max(12, window.innerHeight - 200));
+      // A definite height, not `max-height`: a flex column that only has a max
+      // height never squeezes its children below their content, so the inner
+      // scrollport had no range and the wheel had nothing to move.
+      const cardHeight = Math.max(
+        220,
+        Math.min(Math.round(window.innerHeight * 0.62), window.innerHeight - top - 16, 680),
+      );
+      const keep = () => {
+        if (DOCK.timer !== 0) {
+          window.clearTimeout(DOCK.timer);
+          DOCK.timer = 0;
+        }
+      };
+      // An invisible strip spanning the gap: the pointer crosses it on its way
+      // from the tab to the panel, and it counts as part of the panel.
+      const bridge = h('div', {
+        'data-question-tree-hover': true,
+        'aria-hidden': true,
+        onMouseEnter: keep,
+        style: {
+          position: 'fixed',
+          left,
+          top: DOCK.rect.bottom,
+          width,
+          height: Math.max(0, top - DOCK.rect.bottom),
+          zIndex: 2147482399,
+        },
+      });
+      return h(
+        React.Fragment,
+        null,
+        bridge,
+        h(
+        'div',
+        {
+          'data-question-tree-hover': true,
+          onMouseEnter: keep,
+          onMouseLeave: dockCloseSoon,
+          style: {
+            position: 'fixed',
+            left,
+            top,
+            width,
+            height: cardHeight,
+            zIndex: 2147482400,
+            display: 'flex',
+            flexDirection: 'column',
+            overflow: 'hidden',
+            borderRadius: 10,
+            border: '1px solid var(--dsw-alias-border-l3, #4a5057)',
+            background: 'var(--dsw-alias-bg-l2, #1b2026)',
+            boxShadow: '0 14px 36px rgba(0,0,0,0.45)',
+          },
+        },
+        h(
+          'div',
+          {
+            style: {
+              display: 'flex',
+              alignItems: 'center',
+              gap: 6,
+              padding: '6px 10px',
+              borderBottom: '1px solid var(--dsw-alias-border-l2, #3a3f45)',
+              fontSize: 11,
+              fontWeight: 600,
+            },
+          },
+          h('span', { 'aria-hidden': true }, '⑂'),
+          h('span', null, t0('type.label')),
+        ),
+        h(
+          'div',
+          {
+            style: {
+              flex: 1,
+              minHeight: 0,
+              minWidth: 0,
+              display: 'flex',
+              overflow: 'hidden',
+            },
+          },
+          h(Panel, {
+            questionTree: { sessionId: DOCK.sessionId, t: t0, ctx: CTX, hub: HUB },
+          }),
+        ),
+        ),
+      );
+    }
+
     function Chip() {
       return h(Boundary, null, h(SelectionChip));
     }
@@ -3550,6 +4243,8 @@ return { oneLine, labelOf, createNode, addQuestion, addQuote, removeQuestion, ma
     /* ------------------------------------------------------------------ apply */
 
     function apply(ctx, providedHub) {
+      HUB = providedHub ?? null;
+      CTX = ctx ?? null;
       // The selection service arrives two ways: injected (split build), or
       // handed over by the hub composed into this same module (standalone
       // build, where a plugin cannot inject a service it provides itself).
@@ -3575,7 +4270,7 @@ return { oneLine, labelOf, createNode, addQuestion, addQuote, removeQuestion, ma
                 : `→ ${QTModel.oneLine(QTModel.labelOf(parent), 12)}`;
             },
             run: ({ text, altKey, ctrlKey, anchor }) => {
-              if (CURRENT.sessionId == null) return false;
+              if (sessionNow() == null) return false;
               // Ctrl+click grows the node that is already selected, so the added
               // passage shows up in the list immediately. With nothing selected
               // there is nothing to grow, so it falls through to a new node.
@@ -3583,7 +4278,7 @@ return { oneLine, labelOf, createNode, addQuestion, addQuote, removeQuestion, ma
                 const forest = nodesNow();
                 const next = QTModel.addQuote(forest, CURRENT.selectedId, text, anchor);
                 if (next === forest) return true;
-                writeNodes(CURRENT.sessionId, next);
+                writeNodes(sessionNow(), next);
                 const grown = QTModel.findNode(next, CURRENT.selectedId);
                 say(`已追加 · 该节点共 ${grown ? (grown.quotes ?? []).length : 0} 段`);
                 BUS.bump();
@@ -3597,13 +4292,68 @@ return { oneLine, labelOf, createNode, addQuestion, addQuote, removeQuestion, ma
               // a sibling is one click away: click the node again to deselect.
               CURRENT.selectedId = node.id;
               CURRENT.openId = node.id;
-              writeNodes(CURRENT.sessionId, QTModel.addNode(forest, node));
+              writeNodes(sessionNow(), QTModel.addNode(forest, node));
               BUS.bump();
               return true;
             },
           }),
         'question-tree: tree action',
       );
+
+      // The tree is a Conversation View: it shows up as its own tab next to
+      // 对话 / 轨迹 / 工件, so the sidebar column stays free. The target is
+      // registered first — a tab whose target is missing cannot be activated.
+      ctx.effect(() => {
+        try {
+          const dispose = ctx.uiConversation.views.register({
+            target: VIEW_ID,
+            create: () => {
+              // The tree owns its own store; the target only has to be a valid
+              // incremental builder so the view can be activated.
+              const empty = { nodes: [], timeline: null };
+              return { empty, replace: () => empty, apply: () => empty };
+            },
+          });
+          return typeof dispose === 'function' ? dispose : () => {};
+        } catch (error) {
+          console.warn('[question-tree] view target skipped:', error);
+          return () => {};
+        }
+      }, 'question-tree: view target');
+
+      ctx.effect(
+        () =>
+          ctx.slots.inject('shell.overlay', () =>
+            ctx.slots.register(
+              { name: 'shell.overlay', id: `${ID}/hover`, order: 940 },
+              () => h(React.Fragment, null, h(ViewTabHover), h(TreeHoverPanel)),
+            ),
+          ),
+        'question-tree: tab hover',
+      );
+
+      ctx.effect(() => {
+        try {
+          return ctx.slots.inject('conversation.view', () =>
+            ctx.slots.register(
+              {
+                name: 'conversation.view',
+                id: VIEW_ID,
+                order: 30,
+                locale: NS,
+                label: () => t0('type.label'),
+                inject: (sessionId) => ({
+                  questionTree: { sessionId, t: t0, ctx, hub: selectionActions },
+                }),
+              },
+              Panel,
+            ),
+          );
+        } catch (error) {
+          console.warn('[question-tree] view tab skipped:', error);
+          return () => {};
+        }
+      }, 'question-tree: view tab');
 
       ctx.effect(
         () =>

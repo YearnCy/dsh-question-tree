@@ -168,6 +168,101 @@ window.__ModuleLoader__.load({
       return 'failed';
     }
 
+    /**
+     * The composer handle for one session, resolved from the Host instead of
+     * from a rendered slot.
+     *
+     * The dock bridge only exists while a composer is mounted, and a slot whose
+     * props changed shape would leave the map empty — the send would then fall
+     * through to the clipboard without anyone noticing. The Host's own input
+     * resolver answers for any retained session, so it is the dependable path.
+     *
+     * @returns the session input facade, or null when it cannot be resolved.
+     */
+    async function inputViaHost(ctx, sessionId) {
+      try {
+        const conversation =
+          typeof ctx.get === 'function' ? ctx.get('conversation') : ctx.conversation;
+        const resolver = conversation == null ? null : conversation.input;
+        if (resolver == null || typeof resolver.for !== 'function') return null;
+        const scope = await scopeOf(ctx, sessionId);
+        if (scope == null) return null;
+        return resolver.for(scope) ?? null;
+      } catch {
+        return null;
+      }
+    }
+
+    /**
+     * Pull one older transcript page through the Host.
+     *
+     * Clicking the「加载更早」button is a DOM guess that stops working the moment
+     * the control is labelled differently or lives in another view; the
+     * conversation face knows how to page for any session, so a jump asks it
+     * first and only falls back to the button.
+     *
+     * @returns whether a page was requested.
+     */
+    async function loadOlderVia(ctx, sessionId) {
+      if (ctx == null) return false;
+      try {
+        const conversation =
+          typeof ctx.get === 'function' ? ctx.get('conversation') : ctx.conversation;
+        if (conversation == null || typeof conversation.loadOlder !== 'function') return false;
+        const scope = await scopeOf(ctx, sessionId);
+        if (scope == null) return false;
+        await scope.conversation.loadOlder();
+        return true;
+      } catch {
+        return false;
+      }
+    }
+
+    /** Copy text, reporting whether the clipboard accepted it. */
+    async function copyText(text) {
+      try {
+        if (navigator.clipboard && typeof navigator.clipboard.writeText === 'function') {
+          await navigator.clipboard.writeText(text);
+          return true;
+        }
+      } catch {
+        /* fall through */
+      }
+      return false;
+    }
+
+    /** Put text on the draft and submit it through one facade. */
+    function submitThrough(api, text) {
+      if (api == null) return false;
+      const setDraft = api.setDraft ?? (api.input && api.input.setDraft) ?? api.setText;
+      const submit = api.submit ?? api.send ?? (api.input && api.input.submit);
+      try {
+        if (typeof setDraft === 'function') setDraft.call(api, text);
+      } catch {
+        /* the draft may refuse; submit anyway */
+      }
+      if (typeof submit !== 'function') return false;
+      try {
+        submit.call(api);
+        return true;
+      } catch {
+        return false;
+      }
+    }
+
+    /**
+     * Send one question: the mounted bridge first, the Host's resolver second,
+     * the clipboard last.
+     *
+     * @returns 'sent' | 'copied' | 'filled'.
+     */
+    async function dispatchText(ctx, sessionId, text) {
+      if (submitThrough(INPUT.get(sessionId), text)) return 'sent';
+      const resolved = ctx == null ? null : await inputViaHost(ctx, sessionId);
+      if (submitThrough(resolved, text)) return 'sent';
+      return (await copyText(text)) ? 'copied' : 'filled';
+    }
+
     /** Type text into the composer and try to submit it. */
     function send(sessionId, text) {
       const api = INPUT.get(sessionId);
@@ -836,6 +931,9 @@ window.__ModuleLoader__.load({
       locate,
       insertText,
       send,
+      dispatch: (sessionId, text) => dispatchText(HUB_CTX, sessionId, text),
+      loadOlder: (sessionId) => loadOlderVia(HUB_CTX, sessionId),
+      session: () => LAST_SESSION,
       insertChip: (ctx, sessionId, token) => insertChip(ctx, sessionId, token),
     };
 

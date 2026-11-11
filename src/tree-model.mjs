@@ -179,10 +179,15 @@ export function markQuestionSent(nodes, questionId, sentAt) {
  * A turn that finished before a question was sent cannot answer it, so the
  * comparison is on time, not on count.
  *
+ * @param nodes - the forest.
+ * @param time - the finishing turn's timestamp.
+ * @param options - `understand: true` also flips each node that just received
+ *   its answer to understood, which is the「答完就算懂了」behaviour.
  * @returns `{ nodes, changed }`; unchanged nodes keep their reference.
  */
-export function markAnswered(nodes, time) {
+export function markAnswered(nodes, time, options) {
   const at = Number(time);
+  const understand = options != null && options.understand === true;
   if (!Number.isFinite(at) || at <= 0) return { nodes: nodes ?? [], changed: false };
   let changed = false;
   const next = (nodes ?? []).map((node) => {
@@ -197,7 +202,10 @@ export function markAnswered(nodes, time) {
     });
     if (!touched) return node;
     changed = true;
-    return { ...node, questions: updated };
+    // Its answer just landed: unless the user already said this one is clear,
+    // treat「asked and answered」as「understood」. They can still click it back.
+    const status = understand && node.status === STATUS_UNCLEAR ? STATUS_CLEAR : node.status;
+    return { ...node, status, questions: updated };
   });
   return { nodes: changed ? next : (nodes ?? []), changed };
 }
