@@ -134,6 +134,8 @@ test('one apply ships the whole product', () => {
   assert.deepEqual(names, [
     'conversation.composer.dock',
     'conversation.user.text.node',
+    'conversation.view',
+    'shell.overlay',
     'shell.overlay',
     'sidebar.right.pane.tab',
   ]);

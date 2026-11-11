@@ -124,6 +124,28 @@ test('markAnswered ignores questions sent after the turn finished', () => {
   assert.equal(next[0].questions[1].answeredAt, undefined);
 });
 
+test('markAnswered leaves the status alone unless asked to understand', () => {
+  let nodes = [createNode({ quote: 'a', createdAt: 1, id: 'a' })];
+  nodes = addQuestion(nodes, 'a', 'q', 2);
+  nodes = markQuestionSent(nodes, nodes[0].questions[0].id, 100);
+
+  const plain = markAnswered(nodes, 500).nodes;
+  assert.equal(plain[0].status, 1, 'understood must stay a manual call by default');
+
+  const understood = markAnswered(nodes, 500, { understand: true }).nodes;
+  assert.equal(understood[0].status, 2, 'an answered question marks the node understood');
+  assert.equal(understood[0].questions[0].answeredAt, 500);
+});
+
+test('markAnswered keeps an already-understood node untouched', () => {
+  let nodes = [createNode({ quote: 'a', createdAt: 1, id: 'a', status: 2 })];
+  nodes = addQuestion(nodes, 'a', 'q', 2);
+  nodes = markQuestionSent(nodes, nodes[0].questions[0].id, 100);
+
+  const { nodes: next } = markAnswered(nodes, 500, { understand: true });
+  assert.equal(next[0].status, 2);
+});
+
 test('markAnswered is a no-op without work or without a valid time', () => {
   let nodes = [createNode({ quote: 'a', createdAt: 1, id: 'a' })];
   nodes = addQuestion(nodes, 'a', 'q', 2);
