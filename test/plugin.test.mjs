@@ -42,7 +42,7 @@ const React = {
   useMemo: (fn) => fn(),
   useState: (initial) => [typeof initial === 'function' ? initial() : initial, () => {}],
   useEffect: () => {},
-  useRef: () => ({ current: null }),
+  useRef: (initial) => ({ current: initial ?? null }),
   useSyncExternalStore: (subscribe, getSnapshot) => getSnapshot(),
 };
 
@@ -79,6 +79,7 @@ function applyToFakeContext() {
   const rules = [];
   const provided = {};
   const sources = [];
+  const views = [];
   const ctx = {
     effect: (run) => {
       run();
@@ -96,6 +97,14 @@ function applyToFakeContext() {
       userText: {
         register: (rule) => {
           rules.push(rule);
+          return () => {};
+        },
+      },
+      // Without this stub the view registrations below hit their try/catch and
+      // a broken tab silently passes every test.
+      views: {
+        register: (definition) => {
+          views.push(definition);
           return () => {};
         },
       },
@@ -119,7 +128,7 @@ function applyToFakeContext() {
     sessions: {},
   };
   mod.apply(ctx);
-  APPLIED = { types, slots, rules, provided, sources };
+  APPLIED = { types, slots, rules, provided, sources, views };
   return APPLIED;
 }
 
@@ -153,6 +162,17 @@ test('one apply ships the whole product', () => {
   assert.equal(rules[0].id, 'selection-quote');
 });
 
+test('the tree registers as a conversation view and as a tab', () => {
+  const { views, slots } = applyToFakeContext();
+  assert.equal(views.length, 1, 'one view target is registered');
+  assert.equal(views[0].target, 'question-tree');
+  const tab = slots.find(
+    (entry) => entry.options.name === 'conversation.view' && entry.options.id === 'question-tree',
+  );
+  assert.ok(tab, 'the view tab renders the panel');
+  assert.equal(tab.component.name, 'Panel');
+});
+
 test('both actions appear on the bar built by this same plugin', () => {
   const { provided } = applyToFakeContext();
   const ids = provided.selectionActions.actions().map((action) => action.id);
@@ -167,6 +187,25 @@ test('the panel still renders', () => {
   const element = panel.component({ questionTree: { sessionId: 'session-1', t: (k) => k } });
   assert.equal(typeof element, 'object');
   assert.ok(element.type);
+});
+
+test('the tree action writes into the session the bar hands it', () => {
+  // The bar knows which session the selection came from. Reading the session
+  // from module state instead wrote nodes into whichever panel had mounted
+  // last, which is how a selection in one conversation landed in another.
+  const { provided } = applyToFakeContext();
+  const action = provided.selectionActions.actions().find((item) => item.id === 'question-tree');
+  assert.ok(action, 'the tree action is registered');
+  window.localStorage.setItem('dsh.question-tree.v4.sess-a', '[]');
+  window.localStorage.setItem('dsh.question-tree.v4.sess-b', '[]');
+
+  action.run({ text: '只在 a 里出现的引文', altKey: false, ctrlKey: false, anchor: null, sessionId: 'sess-a' });
+
+  const a = JSON.parse(window.localStorage.getItem('dsh.question-tree.v4.sess-a'));
+  const b = JSON.parse(window.localStorage.getItem('dsh.question-tree.v4.sess-b'));
+  assert.equal(a.length, 1, 'the node lands in the session the bar named');
+  assert.equal(a[0].quote, '只在 a 里出现的引文');
+  assert.equal(b.length, 0, 'the other session is untouched');
 });
 
 test('"add to composer" is offered on every host, so old DSH never loses it', () => {

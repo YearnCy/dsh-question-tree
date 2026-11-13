@@ -255,7 +255,7 @@ const React = {
   useMemo: (fn) => fn(),
   useState: (initial) => [typeof initial === 'function' ? initial() : initial, () => {}],
   useEffect: () => {},
-  useRef: () => ({ current: null }),
+  useRef: (initial) => ({ current: initial ?? null }),
   useSyncExternalStore: (subscribe, getSnapshot) => getSnapshot(),
 };
 

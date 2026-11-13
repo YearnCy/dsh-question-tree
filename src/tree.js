@@ -59,6 +59,7 @@ window.__ModuleLoader__.load({
       'flash.toComposer': '已加入输入框',
       'flash.noAnchor': '这个节点没有记录来源位置',
       'flash.notLoaded': '目标消息还没加载，先点「加载更早」',
+      'flash.failed': '发送失败：没有可用的输入框，已复制到剪贴板也失败了',
       'flash.noComposer': '没有输入框句柄，已复制到剪贴板',
       'root': '根',
     };
@@ -97,6 +98,7 @@ window.__ModuleLoader__.load({
       'flash.toComposer': 'Added to the composer',
       'flash.noAnchor': 'This node has no recorded source position',
       'flash.notLoaded': 'The target message is not loaded yet — click「load earlier」',
+      'flash.failed': 'Could not send: no composer and the clipboard refused too',
       'flash.noComposer': 'No composer handle — copied instead',
       'root': 'root',
     };
@@ -140,6 +142,8 @@ window.__ModuleLoader__.load({
     // passage of the same node, or another node) must cancel the previous
     // loop; otherwise the two would scroll the transcript against each other.
     let LOCATE_CANCEL = null;
+    /** Supersedes an older jump's paging loop; a new jump cancels the old one. */
+    let LOCATE_GEN = 0;
 
     /**
      * ── selection hub ──────────────────────────────────────────────────────
@@ -294,11 +298,15 @@ window.__ModuleLoader__.load({
     }
 
     function writeNodes(sessionId, nodes) {
-      if (typeof sessionId !== 'string' || sessionId === '') return;
+      if (typeof sessionId !== 'string' || sessionId === '') return false;
       try {
         window.localStorage.setItem(STORE_PREFIX + sessionId, JSON.stringify(nodes));
+        return true;
       } catch {
-        /* storage may be full or disabled; the tree still works this session */
+        // Silently losing the write looks exactly like a dead click: the next
+        // `BUS.bump()` re-reads storage and the node simply is not there.
+        say('保存失败：本地存储已满或被禁用');
+        return false;
       }
     }
 
@@ -311,16 +319,23 @@ window.__ModuleLoader__.load({
      * working from the selection bar before any panel has ever rendered.
      */
     function sessionNow() {
-      if (CURRENT.sessionId != null) return CURRENT.sessionId;
-      return HUB != null && typeof HUB.session === 'function' ? HUB.session() : null;
+      // The composer bridge follows the on-screen session, so it is the live
+      // answer. `CURRENT.sessionId` is whatever panel mounted last, which can
+      // lag behind after a surface unmounts — only trust it when nothing else
+      // knows.
+      const live = HUB != null && typeof HUB.session === 'function' ? HUB.session() : null;
+      if (typeof live === 'string' && live !== '') return live;
+      return CURRENT.sessionId;
     }
 
     function nodesNow() {
       return readNodes(sessionNow());
     }
 
-    function commit(nodes) {
-      writeNodes(sessionNow(), nodes);
+    function commit(sessionId, nodes) {
+      // Never infer this from module state: the panel knows which session it is
+      // showing, and writing under another one corrupts that session's tree.
+      writeNodes(sessionId, nodes);
       BUS.bump();
     }
 
@@ -921,6 +936,7 @@ window.__ModuleLoader__.load({
         setAt(null);
       };
       const text = props.text ?? '';
+      React.useEffect(() => cancel, []);
       return h(
         'span',
         {
@@ -948,7 +964,10 @@ window.__ModuleLoader__.load({
                   padding: '6px 8px',
                   borderRadius: 6,
                   border: '1px solid var(--dsw-alias-border-l3, #4a5057)',
-                  background: 'var(--dsw-alias-bg-l3, #232a31)',
+                  // Stack the theme tint over a solid base: the token may be
+                  // translucent, and the question below would read through it.
+                  background:
+                    'linear-gradient(var(--dsw-alias-bg-l3, #232a31), var(--dsw-alias-bg-l3, #232a31)), #232a31',
                   color: 'var(--dsw-alias-label-primary, #e6e6e6)',
                   boxShadow: '0 10px 28px rgba(0,0,0,0.45)',
                   fontSize: 11,
@@ -997,7 +1016,13 @@ window.__ModuleLoader__.load({
           // Click selects (it sets the parent cursor for the next selection);
           // double-click jumps to the source. Keeping them apart matters because
           // selecting a node is a frequent, non-navigating action.
-          onClick: () => onSelect(node.id),
+          // A double-click arrives as click, click, dblclick: toggling on both
+          // clicks left the double-clicked node NOT selected, so the next
+          // selection nested under whatever was current before.
+          onClick: (event) => {
+            if (event != null && event.detail > 1) return;
+            onSelect(node.id);
+          },
           onDoubleClick: () => onLocate(node.id),
         },
         ...Array.from({ length: row.depth }, (_, level) =>
@@ -1066,8 +1091,6 @@ window.__ModuleLoader__.load({
               textOverflow: 'ellipsis',
               whiteSpace: 'nowrap',
               lineHeight: '20px',
-              opacity: question || unclear ? 1 : 0.65,
-              textDecoration: question ? 'none' : unclear ? 'none' : 'line-through',
             },
             // Each passage keeps its own 「」 — the joined string would read as
             // one continuous excerpt.
@@ -1077,7 +1100,19 @@ window.__ModuleLoader__.load({
                   .map((item) => `「${item}」`)
                   .join('\n'),
           },
-          question ? QTModel.oneLine(node.text, 80) : displayQuote(node, 56),
+          // The "already understood" dimming lives on an inner span: opacity on
+          // the Tip wrapper would also fade the tooltip it renders, letting the
+          // question underneath show through the card.
+          h(
+            'span',
+            {
+              style: {
+                opacity: question || unclear ? 1 : 0.65,
+                textDecoration: question ? 'none' : unclear ? 'none' : 'line-through',
+              },
+            },
+            question ? QTModel.oneLine(node.text, 80) : displayQuote(node, 56),
+          ),
         ),
         badge === ''
           ? null
@@ -1182,7 +1217,10 @@ window.__ModuleLoader__.load({
           title: (Array.isArray(node.quotes) && node.quotes.length > 0 ? node.quotes : [label])
             .map((item) => `「${item}」`)
             .join(''),
-          onClick: () => onSelect(node.id),
+          onClick: (event) => {
+            if (event != null && event.detail > 1) return;
+            onSelect(node.id);
+          },
           onDoubleClick: () => onLocate(node.id),
         },
         question
@@ -1816,11 +1854,20 @@ window.__ModuleLoader__.load({
       const ctx = info.ctx;
       useVersion();
       const scrollRef = React.useRef(null);
+      const panelAlive = React.useRef(true);
 
       // Wheel has to be bound natively: React's delegated listener is passive,
       // so a handler there cannot stop the page behind the popup from scrolling.
       // The graph additionally turns the wheel sideways, because its depth grows
       // to the right and a vertical wheel would never reach the deeper nodes.
+      React.useEffect(() => {
+        panelAlive.current = true;
+        return () => {
+          panelAlive.current = false;
+          LOCATE_GEN += 1;
+        };
+      }, []);
+
       React.useEffect(() => {
         const element = scrollRef.current;
         if (element == null) return undefined;
@@ -1836,11 +1883,10 @@ window.__ModuleLoader__.load({
             const before = element.scrollLeft;
             element.scrollLeft += step;
             const moved = element.scrollLeft !== before;
-            if (!event.shiftKey) {
-              event.preventDefault();
-              return;
-            }
-            if (moved) {
+            // Only swallow the wheel when it actually scrolled something:
+            // at either end the event must fall through, or the panel stops
+            // scrolling in every direction.
+            if (moved && !event.shiftKey) {
               event.preventDefault();
               return;
             }
@@ -1855,9 +1901,15 @@ window.__ModuleLoader__.load({
 
       React.useEffect(() => {
         if (typeof sessionId !== 'string' || sessionId === '') return undefined;
+        // Another surface may already be showing this same session; clearing
+        // here would throw away its selected node and the question it is
+        // typing. Only a real session change resets the cursor.
+        const changed = CURRENT.sessionId !== sessionId;
         CURRENT.sessionId = sessionId;
-        CURRENT.selectedId = null;
-        CURRENT.openId = null;
+        if (changed) {
+          CURRENT.selectedId = null;
+          CURRENT.openId = null;
+        }
         BUS.bump();
         return () => {
           if (CURRENT.sessionId === sessionId) CURRENT.sessionId = null;
@@ -1974,36 +2026,63 @@ window.__ModuleLoader__.load({
         // Ask the Host for one page per round — the conversation face pages any
         // session, the button only exists where the transcript happens to be
         // mounted — and report the miss when the pages run out.
+        // A second double-click must win: without a generation, the older
+        // loop resumes after its page lands, re-jumps to the passage the reader
+        // did not pick and cancels the newer landing.
+        const generation = ++LOCATE_GEN;
+        const alive = () => generation === LOCATE_GEN && panelAlive.current !== false;
+        const turnCount = () => document.querySelectorAll('[data-chat-turn]').length;
+        const needle = String(quote ?? '').replace(/\s+/g, '');
+        const wait = (ms) => new Promise((resolve) => window.setTimeout(resolve, ms));
+
         const attempt = async (remaining) => {
+          if (!alive()) return;
           const outcome = locateAnchor(anchor, quote);
-          if (outcome === 'ok') return;
+          if (!alive() || outcome === 'ok') return;
           if (outcome === 'no-anchor') {
             say(t('flash.noAnchor'));
             return;
           }
-          if (remaining > 0) {
-            let requested = false;
-            try {
-              requested =
-                HUB != null && typeof HUB.loadOlder === 'function'
-                  ? await HUB.loadOlder(sessionId)
-                  : false;
-            } catch {
-              requested = false;
-            }
-            if (!requested) {
-              const button = findLoadEarlier();
-              if (button != null) {
-                button.click();
-                requested = true;
-              }
-            }
-            if (requested) {
-              window.setTimeout(() => void attempt(remaining - 1), 260);
-              return;
+          if (remaining <= 0) {
+            say(t('flash.notLoaded'));
+            return;
+          }
+
+          const before = turnCount();
+          let requested = false;
+          try {
+            requested =
+              HUB != null && typeof HUB.loadOlder === 'function'
+                ? await HUB.loadOlder(sessionId)
+                : false;
+          } catch {
+            requested = false;
+          }
+          if (!alive()) return;
+          if (!requested) {
+            const button = findLoadEarlier();
+            if (button != null) {
+              button.click();
+              requested = true;
             }
           }
-          say(t('flash.notLoaded'));
+          if (!requested) {
+            say(t('flash.notLoaded'));
+            return;
+          }
+
+          // The host's `loadOlder` resolves even when there is nothing left, so
+          // progress has to be measured: no new turns and still no anchor means
+          // this session has no older page, and paging 12 more times is waste.
+          await wait(180);
+          if (!alive()) return;
+          if (turnCount() === before && findAnchorTarget(anchor, needle) == null) {
+            say(t('flash.notLoaded'));
+            return;
+          }
+          await wait(80);
+          if (!alive()) return;
+          await attempt(remaining - 1);
         };
         void attempt(12);
       };
@@ -2222,6 +2301,8 @@ window.__ModuleLoader__.load({
             say(t('flash.sent'));
           } else if (outcome === 'copied') {
             say(t('flash.copied'));
+          } else if (outcome === 'failed') {
+            say(t('flash.failed'));
           } else {
             say(t('flash.filled'));
           }
@@ -2254,7 +2335,7 @@ window.__ModuleLoader__.load({
               BUS.bump();
             },
             onLocate: (id) => locateNode(id),
-            onToggle: (id) => commit(QTModel.toggleStatus(readNodes(sessionId), id)),
+            onToggle: (id) => commit(sessionId, QTModel.toggleStatus(readNodes(sessionId), id)),
             onAsk: (id) => {
               CURRENT.selectedId = id;
               CURRENT.openId = CURRENT.openId === id ? null : id;
@@ -2311,7 +2392,7 @@ window.__ModuleLoader__.load({
                 BUS.bump();
               },
               onLocate: (id) => locateNode(id),
-              onToggle: (id) => commit(QTModel.toggleStatus(readNodes(sessionId), id)),
+              onToggle: (id) => commit(sessionId, QTModel.toggleStatus(readNodes(sessionId), id)),
             })
           : h('div', null, ...body);
 
@@ -2542,7 +2623,13 @@ window.__ModuleLoader__.load({
           DOCK.hover = true;
           BUS.bump();
         };
-        const leave = () => dockCloseSoon();
+        const leave = () => {
+          // Without this the poll keeps asking `elementFromPoint` about a
+          // pointer that no longer produces mousemove events (the user moved
+          // into another window), and the card never closes.
+          DOCK.pointer = null;
+          dockCloseSoon();
+        };
         const sync = () => {
           let next = null;
           for (const element of document.querySelectorAll('button, [role="tab"]')) {
@@ -2571,6 +2658,10 @@ window.__ModuleLoader__.load({
           /* older engines: the bind still works for the first render */
         }
         return () => {
+          if (DOCK.timer !== 0) {
+            window.clearTimeout(DOCK.timer);
+            DOCK.timer = 0;
+          }
           document.removeEventListener('mousemove', track, true);
           try {
             observer.disconnect();
@@ -2589,6 +2680,12 @@ window.__ModuleLoader__.load({
     function TreeHoverPanel() {
       useVersion();
       if (!DOCK.hover || DOCK.sessionId == null || DOCK.rect == null) return null;
+      // The card must follow the session that is on screen right now: the id
+      // captured on mouseenter goes stale the moment the reader switches, and
+      // acting on it would write into the previous conversation.
+      const live = HUB != null && typeof HUB.session === 'function' ? HUB.session() : null;
+      const sessionId = typeof live === 'string' && live !== '' ? live : DOCK.sessionId;
+      if (typeof sessionId !== 'string' || sessionId === '') return null;
       const width = Math.min(430, window.innerWidth - 24);
       const left = Math.min(Math.max(12, DOCK.rect.left - 4), window.innerWidth - width - 12);
       const top = Math.min(DOCK.rect.bottom + 8, Math.max(12, window.innerHeight - 200));
@@ -2674,7 +2771,7 @@ window.__ModuleLoader__.load({
             },
           },
           h(Panel, {
-            questionTree: { sessionId: DOCK.sessionId, t: t0, ctx: CTX, hub: HUB },
+            questionTree: { sessionId, t: t0, ctx: CTX, hub: HUB },
           }),
         ),
         ),
@@ -2726,9 +2823,13 @@ window.__ModuleLoader__.load({
       // The tree is one action on the selection hub. Watching the selection,
       // formatting the quote, and inserting into the composer all live in
       // @local/selection-hub; this plugin owns only the tree.
-      ctx.effect(
-        () =>
-          selectionActions.register({
+      ctx.effect(() => {
+        if (selectionActions == null || typeof selectionActions.register !== 'function') {
+          console.warn('[question-tree] no selection service; the tree action is disabled');
+          return () => {};
+        }
+        try {
+          return selectionActions.register({
             id: 'question-tree',
             order: 10,
             label: () => t0('chip.action'),
@@ -2740,22 +2841,24 @@ window.__ModuleLoader__.load({
                 ? `→ ${t0('root')}`
                 : `→ ${QTModel.oneLine(QTModel.labelOf(parent), 12)}`;
             },
-            run: ({ text, altKey, ctrlKey, anchor }) => {
-              if (sessionNow() == null) return false;
+            run: ({ text, altKey, ctrlKey, anchor, sessionId: fromHub }) => {
+              // The bar knows exactly which session the selection came from.
+              const sessionId = fromHub ?? sessionNow();
+              if (sessionId == null) return false;
               // Ctrl+click grows the node that is already selected, so the added
               // passage shows up in the list immediately. With nothing selected
               // there is nothing to grow, so it falls through to a new node.
               if (ctrlKey && CURRENT.selectedId != null) {
-                const forest = nodesNow();
+                const forest = readNodes(sessionId);
                 const next = QTModel.addQuote(forest, CURRENT.selectedId, text, anchor);
                 if (next === forest) return true;
-                writeNodes(sessionNow(), next);
+                writeNodes(sessionId, next);
                 const grown = QTModel.findNode(next, CURRENT.selectedId);
                 say(`已追加 · 该节点共 ${grown ? (grown.quotes ?? []).length : 0} 段`);
                 BUS.bump();
                 return true;
               }
-              const forest = nodesNow();
+              const forest = readNodes(sessionId);
               const chosen = altKey ? null : QTModel.parentFor(forest, CURRENT.selectedId);
               const node = QTModel.createNode({ quotes: [text], anchors: [anchor ?? null], parentId: chosen });
               // Select it: the ask box opens on it, and Ctrl+click appends to the
@@ -2763,13 +2866,16 @@ window.__ModuleLoader__.load({
               // a sibling is one click away: click the node again to deselect.
               CURRENT.selectedId = node.id;
               CURRENT.openId = node.id;
-              writeNodes(sessionNow(), QTModel.addNode(forest, node));
+              writeNodes(sessionId, QTModel.addNode(forest, node));
               BUS.bump();
               return true;
             },
-          }),
-        'question-tree: tree action',
-      );
+          });
+        } catch (error) {
+          console.warn('[question-tree] tree action skipped:', error);
+          return () => {};
+        }
+      }, 'question-tree: tree action');
 
       // The tree is a Conversation View: it shows up as its own tab next to
       // 对话 / 轨迹 / 工件, so the sidebar column stays free. The target is
@@ -2826,9 +2932,9 @@ window.__ModuleLoader__.load({
         }
       }, 'question-tree: view tab');
 
-      ctx.effect(
-        () =>
-          ctx.sidebarRightTabs.register({
+      ctx.effect(() => {
+        try {
+          return ctx.sidebarRightTabs.register({
             id: ID,
             kind: KIND,
             title: () => t0('type.label'),
@@ -2841,9 +2947,12 @@ window.__ModuleLoader__.load({
                 icon: TreeIcon,
               },
             ],
-          }),
-        'question-tree: tab type',
-      );
+          });
+        } catch (error) {
+          console.warn('[question-tree] sidebar tab skipped:', error);
+          return () => {};
+        }
+      }, 'question-tree: tab type');
 
       ctx.effect(
         () =>

@@ -132,21 +132,41 @@ window.__ModuleLoader__.load({
     let LAST_SESSION = null;
     /** sessionId → session-scope Cordis ctx, retained on demand. */
     const SCOPES = new Map();
+    /** sessionId -> in-flight retain, so two callers never retain twice. */
+    const SCOPE_PENDING = new Map();
+    /** Sessions the host refused to open; retrying them every keystroke is waste. */
+    const SCOPE_FAILED = new Set();
     const RETAINED = [];
 
     async function scopeOf(ctx, sessionId) {
       const cached = SCOPES.get(sessionId);
       if (cached !== undefined) return cached;
-      try {
-        const ref = ctx.sessions.retain(sessionId, { source: 'selection-hub' });
-        RETAINED.push(ref);
-        if (ref && ref.ready && typeof ref.ready.then === 'function') await ref.ready;
-        const scope = ref && ref.binding ? ref.binding.ctx : undefined;
-        if (scope !== undefined) SCOPES.set(sessionId, scope);
-        return scope;
-      } catch {
-        return undefined;
-      }
+      // A session the host refused is not retried on every send; one failed
+      // retain used to grow the retained list for the rest of the session.
+      if (SCOPE_FAILED.has(sessionId)) return undefined;
+      const inFlight = SCOPE_PENDING.get(sessionId);
+      if (inFlight !== undefined) return inFlight;
+      const task = (async () => {
+        try {
+          const ref = ctx.sessions.retain(sessionId, { source: 'selection-hub' });
+          RETAINED.push(ref);
+          if (ref && ref.ready && typeof ref.ready.then === 'function') await ref.ready;
+          const scope = ref && ref.binding ? ref.binding.ctx : undefined;
+          if (scope === undefined) {
+            SCOPE_FAILED.add(sessionId);
+            return undefined;
+          }
+          SCOPES.set(sessionId, scope);
+          return scope;
+        } catch {
+          SCOPE_FAILED.add(sessionId);
+          return undefined;
+        } finally {
+          SCOPE_PENDING.delete(sessionId);
+        }
+      })();
+      SCOPE_PENDING.set(sessionId, task);
+      return task;
     }
 
     /** Insert text at the caret without replacing the draft. */
@@ -159,7 +179,14 @@ window.__ModuleLoader__.load({
       for (let attempt = 0; attempt < 2; attempt += 1) {
         try {
           const outcome = insert.call(api, text, capture.call(api));
-          if (outcome != null && typeof outcome.then === 'function') return 'sent';
+          if (outcome != null && typeof outcome.then === 'function') {
+            // The host answers asynchronously; a denial must not surface as an
+            // unhandled rejection in the console.
+            outcome.then(undefined, (error) =>
+              console.warn('[selection-hub] insert rejected:', error),
+            );
+            return 'sent';
+          }
           if (outcome !== false) return 'sent';
         } catch {
           break;
@@ -260,7 +287,10 @@ window.__ModuleLoader__.load({
       if (submitThrough(INPUT.get(sessionId), text)) return 'sent';
       const resolved = ctx == null ? null : await inputViaHost(ctx, sessionId);
       if (submitThrough(resolved, text)) return 'sent';
-      return (await copyText(text)) ? 'copied' : 'filled';
+      if (await copyText(text)) return 'copied';
+      // Nothing accepted it: saying «已填入输入框» here would be a lie the user
+      // only discovers when their question never appears.
+      return 'failed';
     }
 
     /** Type text into the composer and try to submit it. */
@@ -716,10 +746,13 @@ window.__ModuleLoader__.load({
             previous.top === top &&
             previous.left === left &&
             previous.above === fits &&
-            previous.native === (seat != null) &&
+            // `seat` is a prediction; only a pill that is really visible means
+            // the host owns the gesture. Using the prediction here hid our own
+            // 「添加到对话」 on hosts whose surface element exists but is empty.
+            previous.native === (native != null) &&
             previous.ready === ready
               ? previous
-              : { key: chip.key, top, left, above: fits, native: seat != null, ready },
+              : { key: chip.key, top, left, above: fits, native: native != null, ready },
           );
         };
 
@@ -976,9 +1009,14 @@ window.__ModuleLoader__.load({
                 console.warn('[selection-hub] composer chip fell back:', outcome);
                 if (insertText(sessionId, token) !== 'sent') {
                   try {
-                    navigator.clipboard.writeText(token);
-                  } catch {
-                    /* ignore */
+                    const copied = navigator.clipboard.writeText(token);
+                    if (copied != null && typeof copied.catch === 'function') {
+                      copied.catch((error) =>
+                        console.warn('[selection-hub] clipboard refused:', error),
+                      );
+                    }
+                  } catch (error) {
+                    console.warn('[selection-hub] clipboard unavailable:', error);
                   }
                 }
               });
@@ -1070,6 +1108,8 @@ window.__ModuleLoader__.load({
           }
           RETAINED.length = 0;
           SCOPES.clear();
+          SCOPE_PENDING.clear();
+          SCOPE_FAILED.clear();
         },
         'selection-hub: retained scopes',
       );
